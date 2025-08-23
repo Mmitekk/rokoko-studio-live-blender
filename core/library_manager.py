@@ -1,3 +1,4 @@
+import importlib
 import os
 import bpy
 import sys
@@ -54,6 +55,24 @@ class LibraryManager:
 
     # ----------------- Library Installation -----------------
 
+    def reset_current_library_installation(self):
+        importlib.invalidate_caches()
+        if self.libs_info_file.exists():
+            print("Resetting current library installation, deleting library info file.")
+            self.libs_info_file.unlink()
+        try:
+            shutil.rmtree(self.libs_dir)
+        except PermissionError as e:
+            print("Could not fully delete the library directory, please close Blender and try again.")
+            print("Error:", e)
+
+            # Open Popup to tell the user it could not fully delete the library directory, please close Blender and try again.
+            # def draw(self, context):
+            #     self.layout.label(text="Could not fully delete the library directory, please close Blender and try again.")
+            #
+            # bpy.context.window_manager.popup_menu(draw, title="Error", icon='ERROR')
+
+
     def install_libraries(self, required):
         missing_after_install = []
         missing_libs = []
@@ -61,8 +80,12 @@ class LibraryManager:
         # Check which libs are missing
         for lib in required:
             lib_name = self._extract_lib_name(lib)
+            print(f"Checking if {lib_name} exists: ", end='')
             if not pkgutil.find_loader(lib_name):
+                print(f"not found")
                 missing_libs.append(lib)
+            else:
+                print(f"found")
 
         if missing_libs:
             self._update_pip()
@@ -97,6 +120,7 @@ class LibraryManager:
             if installed_libs:
                 print("Successfully installed missing libraries:", installed_libs)
 
+        print("Finished installing libraries")
         self.create_libs_info()
         return missing_after_install
 

@@ -13,6 +13,7 @@ import traceback
 import webbrowser
 
 from .. import updater
+from . import library_manager
 from .utils import ui_refresh_all, cancel_gen
 
 from threading import Thread, Timer
@@ -35,7 +36,14 @@ try:
     logging.getLogger('boto').setLevel(logging.CRITICAL)
     loaded_all_libs = True
 except ImportError as e:
-    print(e)
+    print(traceback.format_exc())
+    library_manager.lib_manager.reset_current_library_installation()
+
+    # from .library_manager import lib_manager
+    # lib_manager = lib_manager()
+    #
+    # # TODO: Maybe try importing the libraries
+
 
 
 # Disable SSL
