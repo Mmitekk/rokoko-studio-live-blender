@@ -78,6 +78,7 @@ class InstallLibsButton(bpy.types.Operator):
         return {'FINISHED'}
 
     def install_libs(self):
+        missing = library_manager.lib_manager.install_libraries(["websockets", "gql==3.5.3", "cryptography", "boto3"])
         if missing:
             raise ImportError("The following libraries could not be installed: "
                               "\n- " + " \n- ".join(missing) +
