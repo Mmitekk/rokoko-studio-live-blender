@@ -57,6 +57,26 @@ class InstallLibsButton(bpy.types.Operator):
             self.report({'ERROR'}, error_str)
             return {'CANCELLED'}
 
+        # Try importing all the libraries to see if they are installed correctly
+        try:
+            print("Verifying library installation by importing them...")
+            import boto3
+            from cryptography.fernet import Fernet
+            from gql import gql, Client
+            from gql.transport.appsync_websockets import AppSyncWebsocketsTransport
+            from gql.transport.appsync_auth import AppSyncApiKeyAuthentication
+            from gql.transport.websockets import log as websockets_logger
+            from lz4 import frame
+        except Exception as e:
+            trace = traceback.format_exc()
+            error_str = f"Library installation failed! Please restart Blender and try again." \
+                        f"\nIf the error persists, let us know." \
+                        f"\n\nFull Error: \n\n{trace}"
+            print(error_str)
+            library_manager.lib_manager.reset_current_library_installation()
+            self.report({'ERROR'}, error_str)
+            return {'CANCELLED'}
+
         # Save login manager data
         classes_logged_in = login_manager.user.classes_logged_in
         classes_logged_out = login_manager.user.classes_logged_out
@@ -85,3 +105,4 @@ class InstallLibsButton(bpy.types.Operator):
                               "  \n\nTry running Blender as an admin and install the libraries again."
                               "  \nSee console for more information.")
         library_manager.lib_manager.install_libraries(["lz4"])
+        importlib.invalidate_caches()
