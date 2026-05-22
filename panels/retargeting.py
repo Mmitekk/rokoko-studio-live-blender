@@ -73,6 +73,34 @@ class RetargetingPanel(ToolPanel, bpy.types.Panel):
         row.label(text='Use Pose:')
         row.prop(context.scene, 'rsl_retargeting_use_pose', expand=True)
 
+        layout.separator()
+
+        # Root Motion settings
+        row = layout.row(align=True)
+        row.label(text='Root Motion:')
+        row.prop(context.scene, 'rsl_retargeting_root_motion_mode', expand=True)
+
+        root_motion_mode = context.scene.rsl_retargeting_root_motion_mode
+        armature_source = get_source_armature()
+        armature_target = get_target_armature()
+
+        if root_motion_mode == 'CUSTOM':
+            if armature_source:
+                row = layout.row(align=True)
+                row.prop_search(context.scene, 'rsl_retargeting_root_bone_source',
+                                armature_source.pose, 'bones', icon='BONE_DATA')
+            if armature_target:
+                row = layout.row(align=True)
+                row.prop_search(context.scene, 'rsl_retargeting_root_bone_target',
+                                armature_target.pose, 'bones', icon='BONE_DATA')
+            row = layout.row(align=True)
+            row.prop(context.scene, 'rsl_retargeting_root_motion_keep_offset')
+        elif root_motion_mode == 'AUTO':
+            row = layout.row(align=True)
+            row.prop(context.scene, 'rsl_retargeting_root_motion_keep_offset')
+            row = layout.row(align=True)
+            row.label(text='  (Auto-detecting hip bone)', icon='INFO')
+
         row = layout.row(align=True)
         row.scale_y = 1.4
         row.operator(retargeting.RetargetAnimation.bl_idname, icon_value=Icons.CALIBRATE.get_icon())

@@ -100,6 +100,38 @@ def register():
             ("CURRENT", "Current", "Select this to use the current pose during retargeting.")
         ]
     )
+    Scene.rsl_retargeting_root_motion_mode = EnumProperty(
+        name="Root Motion",
+        description='Select how root motion should be handled during retargeting.'
+                    '\nOff: No root motion transfer (rotation only).'
+                    '\nAuto: Automatically detect the hip bone as root motion carrier.'
+                    '\nCustom: Manually select which bones carry root motion.',
+        items=[
+            ("OFF", "Off", "Don't transfer root motion, only rotations."),
+            ("AUTO", "Auto", "Automatically detect the hip/root bone for root motion."),
+            ("CUSTOM", "Custom", "Manually select source and target bones for root motion.")
+        ],
+        default='AUTO'
+    )
+    Scene.rsl_retargeting_root_bone_source = StringProperty(
+        name='Source Root Bone',
+        description='Select the source bone that carries root motion (typically Hips or Pelvis).'
+                    '\nOnly used when Root Motion mode is set to Custom',
+        default=''
+    )
+    Scene.rsl_retargeting_root_bone_target = StringProperty(
+        name='Target Root Bone',
+        description='Select the target bone that should receive root motion (typically Hips or Pelvis).'
+                    '\nOnly used when Root Motion mode is set to Custom',
+        default=''
+    )
+    Scene.rsl_retargeting_root_motion_keep_offset = BoolProperty(
+        name='Keep Offset',
+        description='Keep the rest pose offset of the target root bone when applying root motion.'
+                    '\nWhen enabled, the target character starts at its own rest pose position and moves relative to it.'
+                    '\nWhen disabled, the target character exactly matches the source character position',
+        default=True
+    )
     Scene.rsl_retargeting_bone_list = CollectionProperty(
         type=retargeting_ui.BoneListItem
     )

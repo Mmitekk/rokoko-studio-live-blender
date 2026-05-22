@@ -1,5 +1,6 @@
 import bpy
 import copy
+import math
 
 from . import detector
 from ..core import utils
@@ -9,6 +10,14 @@ from ..core import custom_schemes_manager
 from ..panels.retargeting import BoneListItem
 
 RETARGET_ID = '_RSL_RETARGET'
+
+# Common bone name patterns for hip/root motion bones, used for auto-detection
+HIP_BONE_PATTERNS = [
+    'hip', 'hips', 'pelvis', 'root', 'rootmotion',
+    'bip01_pelvis', 'bip_pelvis',
+    'cc_base_pelvis', 'cc_base_hip',
+    'hlp_root', 'def_hips',
+]
 
 
 class BuildBoneList(bpy.types.Operator):
@@ -44,7 +53,51 @@ class BuildBoneList(bpy.types.Operator):
             bone_item.bone_name_source = bone_source
             bone_item.bone_name_target = bone_target
 
+        # Auto-detect root motion bones if in AUTO mode
+        if context.scene.rsl_retargeting_root_motion_mode == 'AUTO':
+            root_source, root_target = self.auto_detect_root_motion_bones(context)
+            if root_source and root_target:
+                context.scene.rsl_retargeting_root_bone_source = root_source
+                context.scene.rsl_retargeting_root_bone_target = root_target
+
         return {'FINISHED'}
+
+    def auto_detect_root_motion_bones(self, context):
+        """Try to automatically find the hip/root motion bone in source and target armatures."""
+        armature_source = get_source_armature()
+        armature_target = get_target_armature()
+
+        # Find the source hip bone from the bone list
+        root_source = ''
+        root_target = ''
+        for item in context.scene.rsl_retargeting_bone_list:
+            bone_key_lower = item.bone_name_key.lower()
+            source_lower = item.bone_name_source.lower()
+            if any(pattern in bone_key_lower or pattern in source_lower for pattern in ['hip', 'pelvis']):
+                if item.bone_name_target:  # Only if target bone was found
+                    root_source = item.bone_name_source
+                    root_target = item.bone_name_target
+                    break
+
+        # Fallback: search by bone name patterns directly in armatures
+        if not root_source:
+            root_source = self.find_hip_bone_by_name(armature_source)
+        if not root_target:
+            root_target = self.find_hip_bone_by_name(armature_target)
+
+        return root_source, root_target
+
+    def find_hip_bone_by_name(self, armature):
+        """Find a hip-like bone by checking its name against common patterns."""
+        if not armature:
+            return ''
+        for bone in armature.pose.bones:
+            bone_name_lower = bone.name.lower().replace('_', '').replace(' ', '')
+            for pattern in HIP_BONE_PATTERNS:
+                pattern_clean = pattern.replace('_', '').replace(' ', '')
+                if pattern_clean in bone_name_lower:
+                    return bone.name
+        return ''
 
 
 class AddBoneListItem(bpy.types.Operator):
@@ -104,12 +157,47 @@ class RetargetAnimation(bpy.types.Operator):
                 continue
             self.retarget_bone_list.append(item)
 
-        # Find the root bones and cancel if none are found
+        # Find the root bones (parentless) and cancel if none are found
         root_bones = self.find_root_bones(context, armature_source, armature_target)
         if not root_bones:
             self.report({'ERROR'}, 'No root bone found!'
                                    '\nCheck if the bones are mapped correctly or try rebuilding the bone list.')
             return {'CANCELLED'}
+
+        # --- Root Motion Logic ---
+        # Determine which bones carry root motion based on user settings
+        root_motion_mode = context.scene.rsl_retargeting_root_motion_mode
+        root_motion_bones = {}  # dict: target_bone_name -> source_bone_name
+
+        if root_motion_mode != 'OFF':
+            if root_motion_mode == 'AUTO':
+                # Auto-detect hip/root motion bone from bone list
+                rm_source, rm_target = self.find_root_motion_bones_auto(
+                    armature_source, armature_target, root_bones)
+            else:  # CUSTOM
+                rm_source = context.scene.rsl_retargeting_root_bone_source
+                rm_target = context.scene.rsl_retargeting_root_bone_target
+
+                # Validate custom root motion bones
+                if rm_source and not armature_source.pose.bones.get(rm_source):
+                    self.report({'ERROR'}, f'Source root motion bone "{rm_source}" not found in source armature!')
+                    return {'CANCELLED'}
+                if rm_target and not armature_target.pose.bones.get(rm_target):
+                    self.report({'ERROR'}, f'Target root motion bone "{rm_target}" not found in target armature!')
+                    return {'CANCELLED'}
+
+            if rm_source and rm_target:
+                root_motion_bones[rm_target] = rm_source
+                print(f'RSL Root Motion: Source="{rm_source}", Target="{rm_target}"')
+            elif root_motion_mode == 'CUSTOM' and (not rm_source or not rm_target):
+                self.report({'WARNING'}, 'Root motion bone not specified. Retargeting without root motion.')
+
+        # Merge root_motion_bones into root_bones for location baking purposes
+        # root_bones_with_motion includes both parentless root bones AND the root motion bone
+        root_bones_with_motion = list(root_bones)
+        for rm_target in root_motion_bones:
+            if rm_target not in root_bones_with_motion:
+                root_bones_with_motion.append(rm_target)
 
         # Check for duplicate target bone entries
         seen = {}
@@ -147,12 +235,27 @@ class RetargetAnimation(bpy.types.Operator):
         source_scale = None
         if context.scene.rsl_retargeting_auto_scaling:
             # Clean source animation
-            # TODO: This causes issues when all Hip bone data is on the armature itself
             self.clean_animation(armature_source)
 
             # Scale the source armature to fit the target armature
             source_scale = copy.deepcopy(armature_source.scale)
-            self.scale_armature(context, armature_source, armature_target, root_bones)
+            self.scale_armature(context, armature_source, armature_target, root_bones_with_motion)
+
+        # --- Root Motion: Save rest pose head positions for offset calculation ---
+        root_motion_rest_offsets = {}
+        if root_motion_bones and context.scene.rsl_retargeting_root_motion_keep_offset:
+            for rm_target, rm_source in root_motion_bones.items():
+                bone_src = armature_source.pose.bones.get(rm_source)
+                bone_tgt = armature_target.pose.bones.get(rm_target)
+                if bone_src and bone_tgt:
+                    # Save the rest-pose head positions in world space
+                    src_head_ws = armature_source.matrix_world @ bone_src.head.copy()
+                    tgt_head_ws = armature_target.matrix_world @ bone_tgt.head.copy()
+                    root_motion_rest_offsets[rm_target] = {
+                        'source_head_ws': src_head_ws,
+                        'target_head_ws': tgt_head_ws,
+                        'offset': tgt_head_ws - src_head_ws,
+                    }
 
         # Duplicate source armature to apply transforms to the animation
         armature_source_original = armature_source
@@ -200,23 +303,38 @@ class RetargetAnimation(bpy.types.Operator):
         for item in self.retarget_bone_list:
             bone_target = armature_target.pose.bones.get(item.bone_name_target)
 
-            # Add constraints
+            # Add COPY_ROTATION constraint
             constraint = bone_target.constraints.new('COPY_ROTATION')
             constraint.name += RETARGET_ID
             constraint.target = armature_source
             constraint.subtarget = item.bone_name_target + RETARGET_ID
 
+            # Add COPY_LOCATION for parentless root bones (original behavior)
             if bone_target.name in root_bones:
                 constraint = bone_target.constraints.new('COPY_LOCATION')
                 constraint.name += RETARGET_ID
                 constraint.target = armature_source
                 constraint.subtarget = item.bone_name_source
 
+            # Add COPY_LOCATION for root motion bones (e.g., hip bone)
+            # This is the key fix: hip bones that have parents also get location transfer
+            elif bone_target.name in root_motion_bones:
+                rm_source_name = root_motion_bones[bone_target.name]
+                constraint = bone_target.constraints.new('COPY_LOCATION')
+                constraint.name += RETARGET_ID
+                constraint.target = armature_source
+                constraint.subtarget = rm_source_name
+
             # Select the bone for animation
             armature_target.data.bones.get(item.bone_name_target).select = True
 
         # Bake the animation to the target armature
-        self.bake_animation(armature_source, armature_target, root_bones)
+        # Use root_bones_with_motion so location data is kept for root motion bones too
+        self.bake_animation(armature_source, armature_target, root_bones_with_motion)
+
+        # --- Root Motion: Apply rest pose offset to baked location keyframes ---
+        if root_motion_bones and context.scene.rsl_retargeting_root_motion_keep_offset:
+            self.apply_root_motion_offset(armature_target, root_motion_rest_offsets)
 
         # Delete the duplicate helper armature
         bpy.ops.object.select_all(action='DESELECT')
@@ -252,17 +370,18 @@ class RetargetAnimation(bpy.types.Operator):
         if source_scale:
             armature_source.scale = source_scale
 
-        # Reset pose positions to old state
-        # self.load_pose_rotations(armature_source, pose_source)
-        # self.load_pose_rotations(armature_target, pose_target)
-
         bpy.ops.object.select_all(action='DESELECT')
 
-        self.report({'INFO'}, 'Retargeted animation.')
+        # Report result
+        if root_motion_bones:
+            rm_names = ', '.join(root_motion_bones.keys())
+            self.report({'INFO'}, f'Retargeted animation with root motion on: {rm_names}')
+        else:
+            self.report({'INFO'}, 'Retargeted animation (no root motion transfer).')
         return {'FINISHED'}
 
     def find_root_bones(self, context, armature_source, armature_target):
-        # Find all root bones
+        # Find all root bones (parentless bones)
         root_bones = []
         for bone in armature_target.pose.bones:
             if not bone.parent:
@@ -280,6 +399,97 @@ class RetargetAnimation(bpy.types.Operator):
                     for bone_child in bone.children:
                         root_bones.append(bone_child)
         return root_bones_animated
+
+    def find_root_motion_bones_auto(self, armature_source, armature_target, root_bones):
+        """
+        Automatically detect the hip/root motion bone pair.
+        Returns (source_bone_name, target_bone_name) or ('', '') if not found.
+
+        Strategy:
+        1. Look for bones in the retarget list whose key is 'hip' or similar
+        2. Fallback: search by bone name patterns in both armatures
+        3. If still not found, use the first animated bone that has location data in the source action
+        """
+        # Strategy 1: Check the bone list for hip-like bones by their detection key
+        for item in self.retarget_bone_list:
+            if not item.bone_name_target:
+                continue
+            bone_key_lower = item.bone_name_key.lower()
+            if bone_key_lower in ('hip', 'hips', 'pelvis'):
+                return item.bone_name_source, item.bone_name_target
+
+        # Strategy 2: Check source bone names against common hip patterns
+        for item in self.retarget_bone_list:
+            if not item.bone_name_target:
+                continue
+            source_lower = item.bone_name_source.lower().replace('_', '').replace(' ', '')
+            for pattern in HIP_BONE_PATTERNS:
+                pattern_clean = pattern.replace('_', '').replace(' ', '')
+                if pattern_clean in source_lower:
+                    return item.bone_name_source, item.bone_name_target
+
+        # Strategy 3: Look for animated location data on bones in the source action
+        # The hip bone typically has the most location keyframes
+        bone_location_counts = {}
+        if armature_source.animation_data and armature_source.animation_data.action:
+            for fcurve in armature_source.animation_data.action.fcurves:
+                if 'location' in fcurve.data_path:
+                    bone_name = fcurve.data_path.split('"')
+                    if len(bone_name) == 3:
+                        name = bone_name[1]
+                        if name not in bone_location_counts:
+                            bone_location_counts[name] = 0
+                        bone_location_counts[name] += len(fcurve.keyframe_points)
+
+        # Find the bone with the most location keyframes that's also in our retarget list
+        if bone_location_counts:
+            # Sort by number of location keyframes (descending)
+            sorted_bones = sorted(bone_location_counts.items(), key=lambda x: x[1], reverse=True)
+            for bone_name, _ in sorted_bones:
+                # Check if this bone is in the retarget list
+                for item in self.retarget_bone_list:
+                    if item.bone_name_source == bone_name and item.bone_name_target:
+                        # Also verify it's not already a parentless root bone
+                        if bone_name not in [rb for rb in root_bones]:
+                            print(f'RSL Root Motion Auto: Found bone with location data: {bone_name}')
+                            return item.bone_name_source, item.bone_name_target
+
+        return '', ''
+
+    def apply_root_motion_offset(self, armature_target, root_motion_rest_offsets):
+        """
+        After baking, adjust the location keyframes of root motion bones
+        so that the target character retains its own rest pose offset.
+
+        Without this, the hip bone location from the source armature is copied
+        directly, which ignores the target armature's rest pose hip position.
+        With offset, we add the difference between target and source rest positions.
+        """
+        if not armature_target.animation_data or not armature_target.animation_data.action:
+            return
+
+        action = armature_target.animation_data.action
+
+        for rm_target, offset_data in root_motion_rest_offsets.items():
+            rest_offset = offset_data['offset']
+
+            # Find and modify location fcurves for the root motion bone
+            for fcurve in action.fcurves:
+                if 'location' not in fcurve.data_path:
+                    continue
+
+                # Extract bone name from data_path like: pose.bones["Hips"].location
+                bone_name_parts = fcurve.data_path.split('"')
+                if len(bone_name_parts) != 3:
+                    continue
+                if bone_name_parts[1] != rm_target:
+                    continue
+
+                # Apply offset to the corresponding axis
+                axis = fcurve.array_index
+                if axis < 3:
+                    for kp in fcurve.keyframe_points:
+                        kp.co.y += rest_offset[axis]
 
     def clean_animation(self, armature_source):
         deletable_fcurves = ['location', 'rotation_euler', 'rotation_quaternion', 'scale']
@@ -302,8 +512,6 @@ class RetargetAnimation(bpy.types.Operator):
                 pose_rotations[bone.name] = copy.deepcopy(bone.rotation_euler)
                 bone.rotation_euler = (0, 0, 0)
 
-        # Reset rotations
-        # bpy.ops.pose.rot_clear()
         bpy.ops.object.mode_set(mode='OBJECT')
 
         return pose_rotations
@@ -487,6 +695,8 @@ class RetargetAnimation(bpy.types.Operator):
                 bone_name = fcurve.data_path.split('"')
                 if len(bone_name) != 3:
                     continue
+                # KEY FIX: Allow location keyframes for both parentless root bones
+                # AND root motion bones (e.g., hip bone with a parent)
                 if bone_name[1] not in root_bones:
                     continue
 
@@ -506,7 +716,7 @@ class RetargetAnimation(bpy.types.Operator):
 
             print_i += 1
 
-        # Clean up animation. Delete all keyframes the use the same value as the previous and next one
+        # Clean up animation. Delete all keyframes that use the same value as the previous and next one
         for fcurve in action_final.fcurves:
             if len(fcurve.keyframe_points) <= 2:
                 continue
