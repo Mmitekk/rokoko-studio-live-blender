@@ -1,6 +1,7 @@
 import bpy
 import copy
 import math
+import mathutils
 
 from . import detector
 from ..core import utils
@@ -17,7 +18,11 @@ HIP_BONE_PATTERNS = [
     'bip01_pelvis', 'bip_pelvis',
     'cc_base_pelvis', 'cc_base_hip',
     'hlp_root', 'def_hips',
+    'mixamorig:hips',  # Mixamo skeleton
 ]
+
+# Detection keys that indicate a hip/root motion bone
+HIP_DETECTION_KEYS = ['hip', 'hips', 'pelvis']
 
 
 class BuildBoneList(bpy.types.Operator):
@@ -123,6 +128,86 @@ class ClearBoneList(bpy.types.Operator):
     def execute(self, context):
         for bone_item in context.scene.rsl_retargeting_bone_list:
             bone_item.bone_name_target = ''
+        return {'FINISHED'}
+
+
+class PrepareForUE5(bpy.types.Operator):
+    """Prepare the retargeted armature for Unreal Engine FBX export.
+    
+    Fixes common issues:
+    - Applies object-level rotation (90° X offset from BVH import)
+    - Sets the armature scale to 1.0 (prevents oversized import in UE5)
+    - Corrects forward/up orientation for UE5
+    
+    Usage: Select the retargeted armature, then click this button before exporting as FBX.
+    """
+    bl_idname = "rsl.prepare_for_ue5"
+    bl_label = "Prepare for UE5 Export"
+    bl_description = ('Prepares the retargeted armature for Unreal Engine FBX export. '
+                      'Applies object rotation and normalizes scale to prevent '
+                      'flipped orientation and oversized import in UE5.')
+    bl_options = {'REGISTER', 'UNDO', 'INTERNAL'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj and obj.type == 'ARMATURE'
+
+    def execute(self, context):
+        armature = context.active_object
+
+        if not armature or armature.type != 'ARMATURE':
+            self.report({'ERROR'}, 'Select an armature object first!')
+            return {'CANCELLED'}
+
+        changes_made = []
+
+        # 1. Apply object rotation (fixes 90° X rotation from BVH import)
+        if armature.rotation_mode == 'QUATERNION':
+            rot = armature.rotation_quaternion
+            has_rotation = abs(rot.w - 1.0) > 0.001 or abs(rot.x) > 0.001 or abs(rot.y) > 0.001 or abs(rot.z) > 0.001
+        elif armature.rotation_mode == 'AXIS_ANGLE':
+            rot = armature.rotation_axis_angle
+            has_rotation = abs(rot[0]) > 0.001
+        else:
+            rot = armature.rotation_euler
+            has_rotation = abs(rot.x) > 0.001 or abs(rot.y) > 0.001 or abs(rot.z) > 0.001
+
+        if has_rotation:
+            # Apply rotation to the armature's bones
+            utils.set_active(armature)
+            bpy.ops.object.transform_apply(location=False, rotation=True, scale=False)
+            changes_made.append('Rotation applied')
+            print(f'RSL UE5 Prep: Applied rotation on "{armature.name}"')
+        else:
+            print('RSL UE5 Prep: No rotation to apply')
+
+        # 2. Normalize scale to 1.0
+        has_non_uniform_scale = (
+            abs(armature.scale.x - 1.0) > 0.001 or
+            abs(armature.scale.y - 1.0) > 0.001 or
+            abs(armature.scale.z - 1.0) > 0.001
+        )
+
+        if has_non_uniform_scale:
+            utils.set_active(armature)
+            bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
+            changes_made.append('Scale applied')
+            print(f'RSL UE5 Prep: Applied scale on "{armature.name}"')
+        else:
+            print('RSL UE5 Prep: Scale already at 1.0')
+
+        # 3. Set armature to rest position temporarily to verify
+        armature.data.pose_position = 'REST'
+        armature.data.pose_position = 'POSE'
+
+        if changes_made:
+            self.report({'INFO'}, f'UE5 prep done: {", ".join(changes_made)}. '
+                                  f'Now export as FBX with Forward=-Z, Up=Y, Scale=1.0')
+        else:
+            self.report({'INFO'}, 'Armature already prepared for UE5 export. '
+                                  'Export as FBX with Forward=-Z, Up=Y, Scale=1.0')
+
         return {'FINISHED'}
 
 
@@ -423,7 +508,10 @@ class RetargetAnimation(bpy.types.Operator):
                 constraint.name += RETARGET_ID
                 constraint.target = armature_source
                 constraint.subtarget = item.bone_name_source
-                print(f'RSL: COPY_LOCATION added for root bone "{bone_target.name}" -> source "{item.bone_name_source}"')
+                # Explicitly set spaces for reliable location copying
+                constraint.target_space = 'WORLD'
+                constraint.owner_space = 'WORLD'
+                print(f'RSL: COPY_LOCATION added for root bone "{bone_target.name}" -> source "{item.bone_name_source}" (WORLD/WORLD)')
 
             # Add COPY_LOCATION for root motion bones (e.g., hip bone with a parent)
             elif bone_target.name in root_motion_bones:
@@ -432,13 +520,24 @@ class RetargetAnimation(bpy.types.Operator):
                 constraint.name += RETARGET_ID
                 constraint.target = armature_source
                 constraint.subtarget = rm_source_name
-                print(f'RSL: COPY_LOCATION added for root motion bone "{bone_target.name}" -> source "{rm_source_name}"')
+                # CRITICAL: Use WORLD space for both to correctly transfer position
+                # regardless of parent bone orientation differences
+                constraint.target_space = 'WORLD'
+                constraint.owner_space = 'WORLD'
+                print(f'RSL: COPY_LOCATION added for root motion bone "{bone_target.name}" -> source "{rm_source_name}" (WORLD/WORLD)')
 
             # Select the bone for animation
             armature_target.data.bones.get(item.bone_name_target).select = True
 
         # Bake the animation to the target armature
         self.bake_animation(armature_source, armature_target, root_bones_with_motion)
+
+        # --- Root Motion: Verify location keyframes and apply fallback if needed ---
+        if root_motion_bones:
+            location_verified = self.verify_root_motion_location(armature_target, root_motion_bones)
+            if not location_verified:
+                print('RSL WARNING: Root motion location keyframes missing after bake. Applying direct transfer fallback...')
+                self.transfer_root_motion_direct(armature_source, armature_target, root_motion_bones, root_bones_with_motion)
 
         # --- Root Motion: Apply rest pose offset to baked location keyframes ---
         if root_motion_bones and context.scene.rsl_retargeting_root_motion_keep_offset:
@@ -523,20 +622,30 @@ class RetargetAnimation(bpy.types.Operator):
             if not item.bone_name_target:
                 continue
             bone_key_lower = item.bone_name_key.lower()
-            if bone_key_lower in ('hip', 'hips', 'pelvis'):
+            if bone_key_lower in HIP_DETECTION_KEYS:
                 print(f'RSL Root Motion Auto: Found by detection key "{bone_key_lower}": '
                       f'source="{item.bone_name_source}", target="{item.bone_name_target}"')
                 return item.bone_name_source, item.bone_name_target
 
-        # Strategy 2: Check source bone names against common hip patterns
+        # Strategy 2: Check source AND target bone names against common hip patterns
         for item in self.retarget_bone_list:
             if not item.bone_name_target:
                 continue
+            # Check source bone name
             source_lower = item.bone_name_source.lower().replace('_', '').replace(' ', '')
             for pattern in HIP_BONE_PATTERNS:
                 pattern_clean = pattern.replace('_', '').replace(' ', '')
                 if pattern_clean in source_lower:
-                    print(f'RSL Root Motion Auto: Found by name pattern "{pattern}": '
+                    print(f'RSL Root Motion Auto: Found by source name pattern "{pattern}": '
+                          f'source="{item.bone_name_source}", target="{item.bone_name_target}"')
+                    return item.bone_name_source, item.bone_name_target
+
+            # Check target bone name (e.g. "mixamorig:Hips")
+            target_lower = item.bone_name_target.lower().replace('_', '').replace(' ', '')
+            for pattern in HIP_BONE_PATTERNS:
+                pattern_clean = pattern.replace('_', '').replace(' ', '')
+                if pattern_clean in target_lower:
+                    print(f'RSL Root Motion Auto: Found by target name pattern "{pattern}": '
                           f'source="{item.bone_name_source}", target="{item.bone_name_target}"')
                     return item.bone_name_source, item.bone_name_target
 
@@ -554,11 +663,11 @@ class RetargetAnimation(bpy.types.Operator):
 
         if bone_location_counts:
             sorted_bones = sorted(bone_location_counts.items(), key=lambda x: x[1], reverse=True)
-            for bone_name, _ in sorted_bones:
+            for bone_name, count in sorted_bones:
                 for item in self.retarget_bone_list:
                     if item.bone_name_source == bone_name and item.bone_name_target:
                         if bone_name not in root_bones:
-                            print(f'RSL Root Motion Auto: Found by location data: {bone_name}')
+                            print(f'RSL Root Motion Auto: Found by location data: {bone_name} ({count} keyframes)')
                             return item.bone_name_source, item.bone_name_target
 
         print('RSL Root Motion Auto: No hip bone found by any strategy')
@@ -682,6 +791,136 @@ class RetargetAnimation(bpy.types.Operator):
                 if axis < 3:
                     for kp in fcurve.keyframe_points:
                         kp.co.y += rest_offset[axis]
+
+    def verify_root_motion_location(self, armature_target, root_motion_bones):
+        """
+        Verify that the baked animation has location keyframes for root motion bones.
+        Returns True if location keyframes were found, False otherwise.
+        """
+        if not armature_target.animation_data or not armature_target.animation_data.action:
+            print('RSL: No animation data on target armature - cannot verify root motion')
+            return False
+
+        action = armature_target.animation_data.action
+        all_ok = True
+
+        for rm_target in root_motion_bones:
+            # Look for location fcurves for this bone
+            bone_path = f'pose.bones["{rm_target}"].location'
+            found_fcurves = []
+            for fcurve in action.fcurves:
+                if fcurve.data_path == bone_path:
+                    found_fcurves.append(fcurve)
+
+            if len(found_fcurves) >= 3:
+                # Check if there's actual movement (not all zeros)
+                has_movement = False
+                for fc in found_fcurves:
+                    values = [kp.co.y for kp in fc.keyframe_points]
+                    if len(values) > 1 and abs(max(values) - min(values)) > 0.001:
+                        has_movement = True
+                        break
+
+                if has_movement:
+                    print(f'RSL Root Motion: Location keyframes VERIFIED for "{rm_target}" '
+                          f'({len(found_fcurves[0].keyframe_points)} keyframes, movement detected)')
+                else:
+                    print(f'RSL Root Motion WARNING: Location keyframes exist for "{rm_target}" '
+                          f'but all values are near-zero (no movement)')
+                    all_ok = False
+            else:
+                print(f'RSL Root Motion WARNING: No location keyframes found for "{rm_target}" '
+                      f'(found {len(found_fcurves)} fcurves, need 3)')
+                all_ok = False
+
+        return all_ok
+
+    def transfer_root_motion_direct(self, armature_source, armature_target,
+                                     root_motion_bones, root_bones_with_motion):
+        """
+        Fallback: Directly transfer root motion location from source to target action.
+        This is used when the constraint-based COPY_LOCATION approach fails to produce
+        location keyframes during baking.
+
+        Strategy: Read the source bone's world-space position at each frame,
+        convert it to the target bone's parent space, and set as location keyframes.
+        """
+        if not armature_source.animation_data or not armature_source.animation_data.action:
+            return
+        if not armature_target.animation_data or not armature_target.animation_data.action:
+            return
+
+        source_action = armature_source.animation_data.action
+        target_action = armature_target.animation_data.action
+
+        for rm_target, rm_source in root_motion_bones.items():
+            source_bone = armature_source.pose.bones.get(rm_source)
+            target_bone = armature_target.pose.bones.get(rm_target)
+
+            if not source_bone or not target_bone:
+                print(f'RSL Direct Transfer: Bone not found - source="{rm_source}", target="{rm_target}"')
+                continue
+
+            # Find all frames in the source animation
+            frame_set = set()
+            for fcurve in source_action.fcurves:
+                for kp in fcurve.keyframe_points:
+                    frame_set.add(int(round(kp.co.x)))
+
+            if not frame_set:
+                print(f'RSL Direct Transfer: No frames found in source action')
+                continue
+
+            frames = sorted(frame_set)
+            print(f'RSL Direct Transfer: Transferring {len(frames)} frames for "{rm_target}"')
+
+            # Get the target bone's parent inverse matrix for space conversion
+            target_parent_inv = mathutils.Matrix.Identity(4)
+            if target_bone.parent:
+                target_parent_inv = target_bone.parent.bone.matrix_local.inverted()
+
+            # Get the target armature's world matrix inverse
+            target_armature_inv = armature_target.matrix_world.inverted()
+
+            # Read source bone's rest location for offset calculation
+            source_rest_loc = source_bone.bone.matrix_local.translation.copy()
+            if source_bone.parent:
+                source_rest_loc = (source_bone.parent.bone.matrix_local.inverted() @ source_bone.bone.matrix_local).translation
+
+            # Switch to pose mode for keyframe insertion
+            bpy.context.view_layer.objects.active = armature_target
+            if armature_target.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+            bpy.ops.object.mode_set(mode='POSE')
+
+            # Sample the source animation at each frame and set target bone location
+            for frame in frames:
+                bpy.context.scene.frame_set(frame)
+
+                # Get source bone's current pose location in its parent space
+                source_loc = source_bone.location.copy()
+
+                # Get source bone's world position
+                source_head_ws = armature_source.matrix_world @ source_bone.head.copy()
+
+                # Convert to target bone's parent local space
+                target_head_local = target_armature_inv @ source_head_ws
+                if target_bone.parent:
+                    target_head_local = target_bone.parent.bone.matrix_local.inverted() @ target_head_local
+
+                # Subtract the target bone's rest pose head position to get the offset
+                target_rest_head = target_bone.bone.matrix_local.translation.copy()
+                if target_bone.parent:
+                    target_rest_head = (target_bone.parent.bone.matrix_local.inverted() @ target_bone.bone.matrix_local).translation
+
+                location_offset = target_head_local - target_rest_head
+
+                # Set the target bone's location
+                target_bone.location = location_offset
+                target_bone.keyframe_insert(data_path='location', frame=frame)
+
+            bpy.ops.object.mode_set(mode='OBJECT')
+            print(f'RSL Direct Transfer: Successfully transferred root motion for "{rm_target}" ({len(frames)} frames)')
 
     def clean_animation(self, armature_source):
         """Remove armature-object-level animation fcurves that interfere with auto-scaling.

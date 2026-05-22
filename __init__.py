@@ -102,6 +102,7 @@ classes_always_enable = [  # These non-panels will always be loaded, all non-pan
     operators.retargeting.ClearBoneList,
     operators.retargeting.ApplyTPoseReference,
     operators.retargeting.RetargetAnimation,
+    operators.retargeting.PrepareForUE5,
     panels.retargeting.RSL_UL_BoneList,
     panels.retargeting.BoneListItem,
     operators.info.LicenseButton,
