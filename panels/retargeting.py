@@ -101,6 +101,35 @@ class RetargetingPanel(ToolPanel, bpy.types.Panel):
             row = layout.row(align=True)
             row.label(text='  (Auto-detecting hip bone)', icon='INFO')
 
+        layout.separator()
+
+        # T-Pose Reference settings
+        row = layout.row(align=True)
+        row.label(text='T-Pose Reference:', icon='ARMATURE_DATA')
+
+        row = layout.row(align=True)
+        row.prop(context.scene, 'rsl_retargeting_tpose_reference', icon='ARMATURE_DATA')
+
+        tpose_ref = context.scene.rsl_retargeting_tpose_reference
+        if tpose_ref:
+            row = layout.row(align=True)
+            row.prop(context.scene, 'rsl_retargeting_tpose_apply_before')
+
+            row = layout.row(align=True)
+            row.scale_y = 1.1
+            row.operator(retargeting.ApplyTPoseReference.bl_idname, icon='CON_ROTLIKE')
+
+            # Show bone match info
+            armature_src = get_source_armature()
+            if armature_src:
+                matched = sum(1 for b in tpose_ref.pose.bones if b.name in armature_src.pose.bones)
+                total = len(tpose_ref.pose.bones)
+                row = layout.row(align=True)
+                row.label(text=f'  Matching bones: {matched}/{total}', icon='GROUP_BONE')
+        else:
+            row = layout.row(align=True)
+            row.label(text='  (Select T-pose armature to fix A-pose issues)', icon='INFO')
+
         row = layout.row(align=True)
         row.scale_y = 1.4
         row.operator(retargeting.RetargetAnimation.bl_idname, icon_value=Icons.CALIBRATE.get_icon())

@@ -10,6 +10,10 @@ def poll_target_armatures(self, obj):
     return obj.type == 'ARMATURE' and obj != get_source_armature()
 
 
+def poll_tpose_reference_armatures(self, obj):
+    return obj.type == 'ARMATURE'
+
+
 # If the retargeting armatures get changed, clear the bone list
 def clear_bone_list(self, context):
     context.scene.rsl_retargeting_bone_list.clear()

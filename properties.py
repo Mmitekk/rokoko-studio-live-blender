@@ -132,6 +132,24 @@ def register():
                     '\nWhen disabled, the target character exactly matches the source character position',
         default=True
     )
+
+    # T-Pose Reference
+    Scene.rsl_retargeting_tpose_reference = PointerProperty(
+        name='T-Pose Reference',
+        description='Select an armature in T-pose to use as reference for correcting the source animation.'
+                    '\nThe T-pose rotations will be applied to the first frame of the source animation before retargeting.'
+                    '\nThis fixes issues when the source animation (e.g. BVH from Kimodo) has a rest pose that differs from T-pose'
+                    ' (e.g. A-pose), which causes arms to freeze during retargeting',
+        type=Object,
+        poll=retargeting.poll_tpose_reference_armatures
+    )
+    Scene.rsl_retargeting_tpose_apply_before = BoolProperty(
+        name='Apply T-Pose Before Retarget',
+        description='Automatically apply T-pose reference to the source animation on frame 1 before retargeting.'
+                    '\nThis ensures the source armature starts from T-pose, which is required for correct retargeting'
+                    '\nwhen the imported BVH has a different rest pose (like A-pose)',
+        default=True
+    )
     Scene.rsl_retargeting_bone_list = CollectionProperty(
         type=retargeting_ui.BoneListItem
     )

@@ -126,6 +126,116 @@ class ClearBoneList(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class ApplyTPoseReference(bpy.types.Operator):
+    """Apply T-pose rotations from a reference armature to the source animation's first frame."""
+    bl_idname = "rsl.apply_tpose_reference"
+    bl_label = "Apply T-Pose to Animation"
+    bl_description = ('Copy T-pose rotations from the reference armature to the source animation on frame 1. '
+                      'This fixes issues where imported BVH animations have a rest pose that differs from T-pose '
+                      '(e.g. A-pose), which causes arms to freeze or not animate correctly during retargeting.')
+    bl_options = {'REGISTER', 'UNDO', 'INTERNAL'}
+
+    @classmethod
+    def poll(cls, context):
+        tpose_ref = context.scene.rsl_retargeting_tpose_reference
+        armature_source = get_source_armature()
+        return (tpose_ref and tpose_ref.type == 'ARMATURE'
+                and armature_source and armature_source.type == 'ARMATURE'
+                and armature_source.animation_data and armature_source.animation_data.action)
+
+    def execute(self, context):
+        tpose_ref = context.scene.rsl_retargeting_tpose_reference
+        armature_source = get_source_armature()
+
+        if not tpose_ref or tpose_ref.type != 'ARMATURE':
+            self.report({'ERROR'}, 'T-Pose reference armature not found or not an armature!')
+            return {'CANCELLED'}
+
+        if not armature_source or armature_source.type != 'ARMATURE':
+            self.report({'ERROR'}, 'Source armature not found or not an armature!')
+            return {'CANCELLED'}
+
+        if not armature_source.animation_data or not armature_source.animation_data.action:
+            self.report({'ERROR'}, 'Source armature has no animation data!')
+            return {'CANCELLED'}
+
+        count = self.apply_tpose(tpose_ref, armature_source)
+
+        self.report({'INFO'}, f'T-Pose applied: {count} bone rotations copied to frame 1.')
+        return {'FINISHED'}
+
+    @staticmethod
+    def apply_tpose(tpose_ref, armature_source, frame=1):
+        """
+        Apply T-pose rotations from a reference armature to the source animation at the given frame.
+
+        This does three things:
+        1. Reads the current rotation of each bone from the T-pose reference armature
+        2. Removes any existing rotation keyframes at the target frame from the source animation
+        3. Sets the source bone rotations to match the T-pose reference and inserts keyframes
+
+        The bone matching is done by name — bones with the same name in both armatures
+        will be matched automatically.
+
+        Args:
+            tpose_ref: The armature that is in T-pose (reference)
+            armature_source: The armature with the animation (target for T-pose application)
+            frame: The frame number to apply T-pose on (default: 1)
+
+        Returns:
+            The number of bones that had their rotations copied
+        """
+        # Go to the target frame
+        bpy.context.scene.frame_set(frame)
+
+        # 1. Read rotations from the T-pose reference armature
+        src_rots = {}
+        for b in tpose_ref.pose.bones:
+            # Store the rotation in whatever mode the bone uses
+            if b.rotation_mode == 'QUATERNION':
+                src_rots[b.name] = ('QUATERNION', tuple(b.rotation_quaternion))
+            else:
+                src_rots[b.name] = ('EULER', tuple(b.rotation_euler))
+
+        # 2. Switch to the source armature in pose mode
+        bpy.context.view_layer.objects.active = armature_source
+        if armature_source.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        bpy.ops.object.mode_set(mode='POSE')
+
+        # 3. Remove old rotation keyframes at the target frame from the source action
+        act = armature_source.animation_data.action if armature_source.animation_data else None
+        if act:
+            fcurves_to_clean = []
+            for fc in act.fcurves:
+                if "rotation_euler" in fc.data_path or "rotation_quaternion" in fc.data_path:
+                    pts = fc.keyframe_points
+                    # Remove from end to not break indices
+                    for i in range(len(pts) - 1, -1, -1):
+                        if abs(pts[i].co.x - float(frame)) < 0.5:
+                            pts.remove(pts[i], fast=True)
+
+        # 4. Apply T-pose rotations and insert keyframes
+        count = 0
+        for name, (rot_mode, rot) in src_rots.items():
+            if name not in armature_source.pose.bones:
+                continue
+
+            bone = armature_source.pose.bones[name]
+
+            if rot_mode == 'QUATERNION':
+                bone.rotation_quaternion = rot
+                bone.keyframe_insert(data_path="rotation_quaternion", frame=frame)
+            else:
+                bone.rotation_euler = rot
+                bone.keyframe_insert(data_path="rotation_euler", frame=frame)
+
+            count += 1
+
+        bpy.ops.object.mode_set(mode='OBJECT')
+        return count
+
+
 class RetargetAnimation(bpy.types.Operator):
     bl_idname = "rsl.retarget_animation"
     bl_label = "Retarget Animation"
@@ -214,6 +324,18 @@ class RetargetAnimation(bpy.types.Operator):
 
         # Save the bone list if the user changed anything
         custom_schemes_manager.save_retargeting_to_list()
+
+        # --- T-Pose Reference: Apply before retargeting ---
+        # This fixes the common issue where BVH animations from Kimodo or other sources
+        # have a rest pose (A-pose) that differs from T-pose, causing arms to freeze
+        tpose_applied = False
+        tpose_ref = context.scene.rsl_retargeting_tpose_reference
+        if tpose_ref and context.scene.rsl_retargeting_tpose_apply_before:
+            if (tpose_ref.type == 'ARMATURE' and
+                    armature_source.animation_data and armature_source.animation_data.action):
+                count = ApplyTPoseReference.apply_tpose(tpose_ref, armature_source, frame=1)
+                tpose_applied = True
+                print(f'RSL: T-Pose reference applied before retargeting ({count} bones)')
 
         # Prepare armatures
         utils.set_active(armature_target)
@@ -373,11 +495,16 @@ class RetargetAnimation(bpy.types.Operator):
         bpy.ops.object.select_all(action='DESELECT')
 
         # Report result
+        parts = []
+        if tpose_applied:
+            parts.append('T-pose applied')
         if root_motion_bones:
             rm_names = ', '.join(root_motion_bones.keys())
-            self.report({'INFO'}, f'Retargeted animation with root motion on: {rm_names}')
+            parts.append(f'root motion on: {rm_names}')
+        if parts:
+            self.report({'INFO'}, 'Retargeted animation (' + '; '.join(parts) + ').')
         else:
-            self.report({'INFO'}, 'Retargeted animation (no root motion transfer).')
+            self.report({'INFO'}, 'Retargeted animation.')
         return {'FINISHED'}
 
     def find_root_bones(self, context, armature_source, armature_target):
