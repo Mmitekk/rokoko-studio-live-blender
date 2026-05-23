@@ -258,25 +258,43 @@ class ExportFBXForUE5(bpy.types.Operator):
         armature_copy = context.active_object
         mesh_copies = [obj for obj in context.selected_objects if obj.type == 'MESH']
 
-        # --- Step 2: Apply all object transforms on the copies ---
+        # --- Step 2: Apply ROTATION and SCALE transforms on the copies ---
         # This bakes the armature's rotation (e.g. -90 deg X from BVH import)
         # and scale into the bone data, which is what UE5 expects.
+        # NOTE: We do NOT apply location here because we will set the armature's
+        # location animation to the root motion below.
         bpy.ops.object.select_all(action='DESELECT')
         utils.set_active(armature_copy)
-        bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+        bpy.ops.object.transform_apply(location=False, rotation=True, scale=True)
 
         for mesh in mesh_copies:
             bpy.ops.object.select_all(action='DESELECT')
             utils.set_active(mesh)
             bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
 
-        # --- Step 3: Remove object-level animation fcurves from the copy ---
-        # After applying transforms, any remaining object-level keyframes
-        # (rotation, location, scale) would conflict with the baked bone data.
+        # --- Step 2b: Transfer root bone location → armature object location ---
+        # CRITICAL for UE5 root motion:
+        # When Blender's FBX exporter creates the FBX file, it creates an
+        # armature node ABOVE the bone hierarchy. UE5 treats this armature
+        # node as the "root bone" of the skeleton. If this root node has no
+        # animation, UE5's root motion extraction finds nothing.
+        #
+        # To fix this, we transfer the walking location animation from the
+        # parentless root bone (e.g. mixamorig:Hips) to the armature OBJECT.
+        # Then we zero out the bone's location. The armature node in FBX will
+        # have the walking motion, and UE5 will correctly extract root motion.
+        #
+        # The visual result is identical: armature moves forward + bone at
+        # (0,0,0) relative to armature = same world position as before.
+        self._transfer_root_motion_to_armature_object(armature_copy)
+
+        # --- Step 3: Remove object-level ROTATION and SCALE animation fcurves ---
+        # After applying transforms, any rotation/scale keyframes are stale.
+        # We KEEP the location animation (it now carries the root motion).
         if armature_copy.animation_data and armature_copy.animation_data.action:
             fcurves_to_remove = []
             for fcurve in armature_copy.animation_data.action.fcurves:
-                if fcurve.data_path in ('location', 'rotation_euler', 'rotation_quaternion',
+                if fcurve.data_path in ('rotation_euler', 'rotation_quaternion',
                                         'rotation_axis_angle', 'scale'):
                     fcurves_to_remove.append(fcurve)
             for fcurve in fcurves_to_remove:
@@ -288,25 +306,17 @@ class ExportFBXForUE5(bpy.types.Operator):
                 armature_copy.animation_data.nla_tracks.remove(track)
 
         # Remove orphaned actions that could cause multiple animations in UE5.
-        # Blender's FBX exporter may include actions from bpy.data.actions that
-        # reference bones of the exported armature, even with
-        # bake_anim_use_all_actions=False.
-        # We aggressively remove ALL actions with no real users, including those
-        # kept alive only by use_fake_user=True. These accumulate from repeated
-        # retargets and NLA bakes and cause the "7 animations" issue in UE5.
         current_action = armature_copy.animation_data.action if armature_copy.animation_data else None
         for action in list(bpy.data.actions):
             try:
-                # Never remove the action currently assigned to our export copy
                 if action == current_action:
                     continue
-                # Count real users (subtract 1 for fake_user if set)
                 real_users = action.users - (1 if action.use_fake_user else 0)
                 if real_users <= 0:
                     action.use_fake_user = False
                     bpy.data.actions.remove(action)
             except ReferenceError:
-                pass  # Action was already removed by Blender
+                pass
 
         # --- Step 4: Select all copies for export ---
         bpy.ops.object.select_all(action='DESELECT')
@@ -315,11 +325,6 @@ class ExportFBXForUE5(bpy.types.Operator):
             mesh.select_set(True)
 
         # --- Step 5: Export FBX with UE5 settings ---
-        # Key settings that make this work with UE5:
-        #   axis_forward='-Z' / axis_up='Y'  — standard Blender→UE5 axis conversion
-        #   apply_scale_options='FBX_SCALE_ALL' — bake scale so UE5 gets correct size
-        #   armature_nodetype='NULL' — avoid extra root bone in UE5
-        #   bake_anim=True — bake all animation into the FBX
         try:
             bpy.ops.export_scene.fbx(
                 filepath=filepath,
@@ -343,7 +348,7 @@ class ExportFBXForUE5(bpy.types.Operator):
                 use_mesh_vertices=False,
                 primary_bone_axis='Y',
                 secondary_bone_axis='X',
-                armature_nodetype='NULL',
+                armature_nodetype='ROOT',
                 bake_space_transform=False,
                 object_types={'ARMATURE', 'MESH'},
             )
@@ -366,7 +371,7 @@ class ExportFBXForUE5(bpy.types.Operator):
                     bake_anim_use_all_actions=False,
                     primary_bone_axis='Y',
                     secondary_bone_axis='X',
-                    armature_nodetype='NULL',
+                    armature_nodetype='ROOT',
                     object_types={'ARMATURE', 'MESH'},
                 )
                 print(f'RSL Export FBX (compat mode): Exported to "{filepath}"')
@@ -389,6 +394,174 @@ class ExportFBXForUE5(bpy.types.Operator):
 
         self.report({'INFO'}, f'FBX exported for UE5: {filepath}')
         return {'FINISHED'}
+
+    @staticmethod
+    def _transfer_root_motion_to_armature_object(armature):
+        """
+        Transfer root bone location animation to the armature OBJECT's location.
+
+        UE5 root motion extraction uses the topmost bone in the skeleton hierarchy.
+        When Blender exports FBX, the armature object becomes a root node ABOVE all
+        bones. If this root node has no animation, UE5 can't extract root motion.
+
+        This method:
+        1. Finds the parentless root bone (e.g. mixamorig:Hips in Mixamo)
+        2. Reads its location keyframes
+        3. Creates matching armature object location keyframes
+        4. Zeros out the root bone's location keyframes
+
+        The visual result is identical because:
+          world_pos(bone) = armature.location + armature_rot * (bone_rest + bone.location)
+          After transfer: armature.location = bone.location_old, bone.location = 0
+          So: world_pos(bone) = bone.location_old + armature_rot * bone_rest  ✓
+        """
+        if not armature.animation_data or not armature.animation_data.action:
+            print('RSL Export: No animation data - skipping root motion transfer')
+            return
+
+        action = armature.animation_data.action
+
+        # Find the parentless root bone
+        root_bone_name = ''
+        for bone in armature.pose.bones:
+            if not bone.parent:
+                root_bone_name = bone.name
+                break
+
+        if not root_bone_name:
+            print('RSL Export: No parentless root bone found - skipping root motion transfer')
+            return
+
+        # Check if the root bone has location animation
+        root_loc_fcurves = {}
+        for fcurve in action.fcurves:
+            if fcurve.data_path == f'pose.bones["{root_bone_name}"].location':
+                root_loc_fcurves[fcurve.array_index] = fcurve
+
+        if not root_loc_fcurves:
+            print(f'RSL Export: Root bone "{root_bone_name}" has no location animation - '
+                  f'skipping transfer')
+            return
+
+        # Check if there's actual movement (not just constant offset)
+        has_movement = False
+        for axis, fcurve in root_loc_fcurves.items():
+            values = [kp.co.y for kp in fcurve.keyframe_points]
+            if len(values) > 1 and abs(max(values) - min(values)) > 0.001:
+                has_movement = True
+                break
+
+        if not has_movement:
+            print(f'RSL Export: Root bone "{root_bone_name}" location has no movement - '
+                  f'skipping transfer')
+            return
+
+        print(f'RSL Export: Transferring root motion from bone "{root_bone_name}" '
+              f'to armature object ({len(root_loc_fcurves)} axes)')
+
+        # Collect all keyframe frames from root bone location
+        all_frames = set()
+        for axis, fcurve in root_loc_fcurves.items():
+            for kp in fcurve.keyframe_points:
+                all_frames.add(int(round(kp.co.x)))
+        all_frames = sorted(all_frames)
+
+        if not all_frames:
+            return
+
+        # Read root bone location values at each frame
+        # We need to evaluate at each frame to handle interpolation correctly
+        bpy.context.view_layer.objects.active = armature
+        if armature.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+
+        root_bone = armature.pose.bones[root_bone_name]
+
+        # Read bone location values at each frame
+        bone_locations = {}  # frame -> [x, y, z]
+        for frame in all_frames:
+            bpy.context.scene.frame_set(frame)
+            bone_locations[frame] = list(root_bone.location)
+
+        # Also sample at a few intermediate frames for smoother animation
+        frame_start = all_frames[0]
+        frame_end = all_frames[-1]
+        extra_frames = set()
+        for frame in range(frame_start, frame_end + 1):
+            if frame not in all_frames:
+                extra_frames.add(frame)
+
+        # Sample extra frames (limit to avoid too many keyframes)
+        if extra_frames and len(extra_frames) < 500:
+            for frame in sorted(extra_frames):
+                bpy.context.scene.frame_set(frame)
+                loc = list(root_bone.location)
+                # Only add keyframe if significantly different from nearest existing
+                bone_locations[frame] = loc
+                all_frames.append(frame)
+
+        all_frames = sorted(bone_locations.keys())
+
+        # Create armature object location keyframes from bone location
+        armature.animation_data_create()
+        if not armature.animation_data.action:
+            action_for_loc = armature.animation_data.action
+        else:
+            action_for_loc = armature.animation_data.action
+
+        # Remove any existing armature location fcurves
+        existing_loc_fcurves = []
+        for fcurve in action_for_loc.fcurves:
+            if fcurve.data_path == 'location':
+                existing_loc_fcurves.append(fcurve)
+        for fcurve in existing_loc_fcurves:
+            action_for_loc.fcurves.remove(fcurve)
+
+        # Create new armature location fcurves
+        loc_fcurves = {}
+        for axis in range(3):
+            fc = action_for_loc.fcurves.new(data_path='location', index=axis)
+            loc_fcurves[axis] = fc
+
+        # Populate armature location keyframes
+        for frame in all_frames:
+            loc = bone_locations[frame]
+            for axis in range(3):
+                fc = loc_fcurves[axis]
+                fc.keyframe_points.insert(frame, loc[axis])
+
+        # Update fcurve handles for smooth interpolation
+        for axis, fc in loc_fcurves.items():
+            fc.update()
+
+        # Now zero out the root bone's location keyframes
+        for axis, fcurve in root_loc_fcurves.items():
+            for kp in fcurve.keyframe_points:
+                kp.co.y = 0.0
+            fcurve.update()
+
+        # Also set the bone's current location to zero
+        root_bone.location = (0, 0, 0)
+
+        # Verify the transfer
+        arm_loc_fcurves = []
+        for fcurve in action_for_loc.fcurves:
+            if fcurve.data_path == 'location':
+                arm_loc_fcurves.append(fcurve)
+
+        if len(arm_loc_fcurves) >= 3:
+            max_val = 0
+            for fc in arm_loc_fcurves:
+                values = [kp.co.y for kp in fc.keyframe_points]
+                if len(values) > 1:
+                    spread = abs(max(values) - min(values))
+                    max_val = max(max_val, spread)
+            print(f'RSL Export: Root motion transferred to armature object '
+                  f'({len(arm_loc_fcurves[0].keyframe_points)} keyframes, '
+                  f'max displacement={max_val:.4f})')
+        else:
+            print(f'RSL Export WARNING: Only {len(arm_loc_fcurves)} armature location '
+                  f'fcurves created (expected 3)')
 
     @staticmethod
     def _cleanup(armature_copy, mesh_copies):
