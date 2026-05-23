@@ -60,7 +60,7 @@ class UpdateToSelectedButton(bpy.types.Operator):
 class UpdateToBetaButton(bpy.types.Operator):
     bl_idname = 'rsl_updater.update_beta'
     bl_label = 'Install Latest from GitHub'
-    bl_description = 'Download and install the latest version from the master branch on GitHub'
+    bl_description = 'Download and install the latest version from the master branch on GitHub (Mmitekk/rokoko-studio-live-blender)'
     bl_options = {'INTERNAL'}
 
     @classmethod

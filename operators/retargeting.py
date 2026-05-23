@@ -287,6 +287,15 @@ class ExportFBXForUE5(bpy.types.Operator):
             for track in list(armature_copy.animation_data.nla_tracks):
                 armature_copy.animation_data.nla_tracks.remove(track)
 
+        # Remove orphaned actions that could cause multiple animations in UE5.
+        # Blender's FBX exporter may include actions from bpy.data.actions that
+        # reference bones of the exported armature, even with
+        # bake_anim_use_all_actions=False.
+        current_action = armature_copy.animation_data.action if armature_copy.animation_data else None
+        for action in list(bpy.data.actions):
+            if action.users == 0 and not action.use_fake_user:
+                bpy.data.actions.remove(action)
+
         # --- Step 4: Select all copies for export ---
         bpy.ops.object.select_all(action='DESELECT')
         armature_copy.select_set(True)
@@ -586,6 +595,19 @@ class RetargetAnimation(bpy.types.Operator):
                 armature_source.animation_data.action.fcurves.remove(fcurve)
                 print(f'RSL: Removed armature-level location fcurve (axis {fcurve.array_index})')
 
+        # --- Clean up previous retargeting data on the target armature ---
+        # Multiple retargeting runs can leave NLA tracks and orphaned actions
+        # which cause the FBX exporter to include multiple animations.
+        if armature_target.animation_data:
+            for track in list(armature_target.animation_data.nla_tracks):
+                armature_target.animation_data.nla_tracks.remove(track)
+                print(f'RSL: Removed old NLA track from target armature')
+            # Remove orphaned retargeted actions from previous runs
+            for action in list(bpy.data.actions):
+                if 'Retarget' in action.name and action.users == 0:
+                    bpy.data.actions.remove(action)
+                    print(f'RSL: Removed orphaned action "{action.name}"')
+
         # Prepare armatures
         utils.set_active(armature_target)
         bpy.ops.object.mode_set(mode='OBJECT')
@@ -718,6 +740,13 @@ class RetargetAnimation(bpy.types.Operator):
                 print('RSL WARNING: Root motion location keyframes missing after bake. Applying direct transfer fallback...')
                 self.transfer_root_motion_direct(armature_source, armature_target, root_motion_bones, root_bones_with_motion)
 
+        # --- Root Motion: Extract root motion from HIPS to parentless ROOT bone ---
+        # UE5 extracts root motion from the parentless ROOT bone, not from HIPS.
+        # After baking, the HIPS bone has the forward walking location data, but UE5
+        # needs it on the ROOT bone. This method transfers the motion correctly.
+        if root_motion_bones:
+            self.extract_root_motion_to_root_bone(armature_target, root_motion_bones, root_bones)
+
         # --- Root Motion: Apply rest pose offset to baked location keyframes ---
         if root_motion_bones and context.scene.rsl_retargeting_root_motion_keep_offset:
             self.apply_root_motion_offset(armature_target, root_motion_rest_offsets)
@@ -733,6 +762,13 @@ class RetargetAnimation(bpy.types.Operator):
 
         # Change action name
         armature_target.animation_data.action.name = armature_source.animation_data.action.name + ' Retarget'
+
+        # Final cleanup: remove orphaned actions that are no longer used.
+        # This prevents the FBX exporter from including stale animations
+        # (which was causing UE5 to import 7 animations instead of 1).
+        for action in list(bpy.data.actions):
+            if action.users == 0 and not action.use_fake_user:
+                bpy.data.actions.remove(action)
 
         # Remove constraints from target armature
         for bone in armature_target.pose.bones:
@@ -1095,6 +1131,137 @@ class RetargetAnimation(bpy.types.Operator):
 
         return all_ok
 
+    def extract_root_motion_to_root_bone(self, armature_target, root_motion_bones, root_bones):
+        """
+        Extract root motion from the HIPS bone to the parentless ROOT bone.
+
+        UE5 extracts root motion from the parentless ROOT bone (the one with no
+        parent). After retargeting, the HIPS bone has location animation (forward
+        walking, etc.) but the ROOT bone has none. This means UE5 sees no root
+        motion.
+
+        This method:
+        1. Reads the HIPS bone's pose position at each keyframe
+        2. Computes the delta from the rest pose (in armature space)
+        3. Sets the ROOT bone's location to this delta (ROOT has no parent,
+           so ROOT.location is in armature space)
+        4. Zeros out the HIPS bone's location (the motion is now on ROOT)
+
+        The result is mathematically equivalent: the character's world-space
+        position is identical before and after this transformation. The only
+        difference is that the forward motion is now carried by ROOT instead of
+        HIPS, which is what UE5 expects.
+        """
+        if not armature_target.animation_data or not armature_target.animation_data.action:
+            return
+
+        action = armature_target.animation_data.action
+
+        # Find the parentless ROOT bone
+        root_bone_name = ''
+        for bone_name in root_bones:
+            bone = armature_target.pose.bones.get(bone_name)
+            if bone and not bone.parent:
+                root_bone_name = bone_name
+                break
+
+        # Get the HIPS bone name from root_motion_bones
+        hips_bone_name = ''
+        for rm_target in root_motion_bones:
+            hips_bone_name = rm_target
+            break
+
+        if not root_bone_name or not hips_bone_name:
+            print('RSL Root Motion Extract: Could not find root or hips bone')
+            return
+
+        if root_bone_name == hips_bone_name:
+            # Root bone is already the hips bone (e.g. in some skeletons
+            # the hips IS the parentless bone). Nothing to extract.
+            print(f'RSL Root Motion Extract: Root bone "{root_bone_name}" is the same '
+                  f'as hips bone - no extraction needed')
+            return
+
+        root_bone = armature_target.pose.bones[root_bone_name]
+        hips_bone = armature_target.pose.bones[hips_bone_name]
+
+        # Read all frames from HIPS location keyframes
+        hips_frames = set()
+        for fcurve in action.fcurves:
+            if fcurve.data_path == f'pose.bones["{hips_bone_name}"].location':
+                for kp in fcurve.keyframe_points:
+                    hips_frames.add(int(round(kp.co.x)))
+
+        if not hips_frames:
+            print('RSL Root Motion Extract: No HIPS location keyframes found')
+            return
+
+        frames = sorted(hips_frames)
+        print(f'RSL Root Motion Extract: Extracting from "{hips_bone_name}" to '
+              f'"{root_bone_name}" ({len(frames)} frames)')
+
+        # First pass: read the HIPS bone's head position at each frame.
+        # We must do this BEFORE modifying any bone locations, because
+        # changing ROOT.location would shift HIPS' computed head position
+        # (since HIPS is a child of ROOT).
+        hips_head_per_frame = {}
+        for frame in frames:
+            bpy.context.scene.frame_set(frame)
+            # hips_bone.head is the current pose head position in armature space
+            hips_head_per_frame[frame] = hips_bone.head.copy()
+
+        # Rest pose head position (in armature space)
+        # bone.head_local is the REST pose head position in armature space
+        hips_rest_head = hips_bone.bone.head_local.copy()
+
+        # Switch to pose mode for keyframe insertion
+        bpy.context.view_layer.objects.active = armature_target
+        if armature_target.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        bpy.ops.object.mode_set(mode='POSE')
+
+        # Second pass: set ROOT and HIPS locations
+        for frame in frames:
+            bpy.context.scene.frame_set(frame)
+
+            # The delta between current HIPS position and rest HIPS position
+            # is the root motion vector, expressed in armature space.
+            # Since ROOT has no parent, ROOT.location is in armature space,
+            # so this delta is exactly what ROOT.location should be.
+            delta = hips_head_per_frame[frame] - hips_rest_head
+
+            # Set ROOT's location to carry the root motion
+            root_bone.location = delta
+            root_bone.keyframe_insert(data_path='location', frame=frame)
+
+            # Zero out HIPS' location. The motion is now on ROOT.
+            # Mathematically, the character's world-space position is preserved:
+            # Before: HIPS.head = ROOT.rest + ROOT_rot @ (HIPS_rest_offset + HIPS_loc)
+            # After:  HIPS.head = ROOT.rest + delta + ROOT_rot @ HIPS_rest_offset
+            #         = ROOT.rest + (HIPS_cur - HIPS_rest) + ROOT_rot @ HIPS_rest_offset
+            # Since ROOT wasn't moving before (ROOT_loc was ~0 from source root
+            # with no animation), and delta = HIPS_cur - HIPS_rest,
+            # the new HIPS position equals the original HIPS position.
+            hips_bone.location = (0, 0, 0)
+            hips_bone.keyframe_insert(data_path='location', frame=frame)
+
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        # Clean up: remove HIPS location fcurves that are all zeros
+        # (they were set to 0 and are redundant - no motion means no need for keyframes)
+        fcurves_to_check = []
+        for fcurve in action.fcurves:
+            if fcurve.data_path == f'pose.bones["{hips_bone_name}"].location':
+                fcurves_to_check.append(fcurve)
+
+        for fcurve in fcurves_to_check:
+            all_zero = all(abs(kp.co.y) < 0.0001 for kp in fcurve.keyframe_points)
+            if all_zero:
+                action.fcurves.remove(fcurve)
+
+        print(f'RSL Root Motion Extract: Successfully extracted root motion from '
+              f'"{hips_bone_name}" to "{root_bone_name}"')
+
     def transfer_root_motion_direct(self, armature_source, armature_target,
                                      root_motion_bones, root_bones_with_motion):
         """
@@ -1428,6 +1595,15 @@ class RetargetAnimation(bpy.types.Operator):
 
         for action in actions_all:
             bpy.data.actions.remove(action)
+
+        # Clean up NLA tracks left over from the bake process.
+        # Each nla.bake(use_current_action=False) pushes the previous action to
+        # an NLA strip. These stale strips cause FBX export to include multiple
+        # animations (e.g. 7 instead of 1 in UE5).
+        if armature_target.animation_data:
+            for track in list(armature_target.animation_data.nla_tracks):
+                armature_target.animation_data.nla_tracks.remove(track)
+            print(f'RSL: Cleaned up NLA tracks after bake')
 
         print('Retargeting Time:', round(time.time() - start_time, 2), 'seconds')
         wm.progress_end()

@@ -379,7 +379,7 @@ def _add_master_branch_fallback():
         'zipball_url': GITHUB_URL_MASTER,
         'body': f'Latest version from the master branch.\nCommit: {commit_sha}\nDate: {commit_date}',
         'published_at': commit_date if commit_date != 'Unknown' else '2025-01-01T00:00:00Z',
-        'prerelease': True  # Mark as pre-release so it shows as (beta)
+        'prerelease': False  # Not marked as prerelease so it shows up as an available update
     })
 
 
