@@ -7,7 +7,7 @@ bl_info = {
     'description': 'Stream your Rokoko Studio animations directly into Blender',
     'version': (1, 4, 3),
     'blender': (2, 80, 0),
-    'wiki_url': 'https://github.com/Rokoko/rokoko-studio-live-blender#readme',
+    'wiki_url': 'https://github.com/Mmitekk/rokoko-studio-live-blender#readme',
 }
 
 beta_branch = False

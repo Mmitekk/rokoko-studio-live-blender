@@ -133,19 +133,22 @@ class ClearBoneList(bpy.types.Operator):
 
 class PrepareForUE5(bpy.types.Operator):
     """Prepare the retargeted armature for Unreal Engine FBX export.
-    
+
     Fixes common issues:
     - Applies object-level rotation (90° X offset from BVH import)
     - Sets the armature scale to 1.0 (prevents oversized import in UE5)
-    - Corrects forward/up orientation for UE5
-    
+    - Applies object location (moves root to origin)
+    - Bakes armature object transforms into bones before applying,
+      so bone animation data is preserved correctly
+    - Resets object transforms after baking
+
     Usage: Select the retargeted armature, then click this button before exporting as FBX.
     """
     bl_idname = "rsl.prepare_for_ue5"
     bl_label = "Prepare for UE5 Export"
     bl_description = ('Prepares the retargeted armature for Unreal Engine FBX export. '
-                      'Applies object rotation and normalizes scale to prevent '
-                      'flipped orientation and oversized import in UE5.')
+                      'Applies object transforms into bones, normalizes scale and rotation '
+                      'to prevent flipped orientation and oversized import in UE5.')
     bl_options = {'REGISTER', 'UNDO', 'INTERNAL'}
 
     @classmethod
@@ -162,7 +165,10 @@ class PrepareForUE5(bpy.types.Operator):
 
         changes_made = []
 
-        # 1. Apply object rotation (fixes 90° X rotation from BVH import)
+        # Check what needs to be applied
+        has_non_identity_transform = False
+
+        # Check rotation
         if armature.rotation_mode == 'QUATERNION':
             rot = armature.rotation_quaternion
             has_rotation = abs(rot.w - 1.0) > 0.001 or abs(rot.x) > 0.001 or abs(rot.y) > 0.001 or abs(rot.z) > 0.001
@@ -173,39 +179,95 @@ class PrepareForUE5(bpy.types.Operator):
             rot = armature.rotation_euler
             has_rotation = abs(rot.x) > 0.001 or abs(rot.y) > 0.001 or abs(rot.z) > 0.001
 
-        if has_rotation:
-            # Apply rotation to the armature's bones
-            utils.set_active(armature)
-            bpy.ops.object.transform_apply(location=False, rotation=True, scale=False)
-            changes_made.append('Rotation applied')
-            print(f'RSL UE5 Prep: Applied rotation on "{armature.name}"')
-        else:
-            print('RSL UE5 Prep: No rotation to apply')
-
-        # 2. Normalize scale to 1.0
+        # Check scale
         has_non_uniform_scale = (
             abs(armature.scale.x - 1.0) > 0.001 or
             abs(armature.scale.y - 1.0) > 0.001 or
             abs(armature.scale.z - 1.0) > 0.001
         )
 
-        if has_non_uniform_scale:
-            utils.set_active(armature)
-            bpy.ops.object.transform_apply(location=False, rotation=False, scale=True)
-            changes_made.append('Scale applied')
-            print(f'RSL UE5 Prep: Applied scale on "{armature.name}"')
-        else:
-            print('RSL UE5 Prep: Scale already at 1.0')
+        # Check location
+        has_location = (
+            abs(armature.location.x) > 0.001 or
+            abs(armature.location.y) > 0.001 or
+            abs(armature.location.z) > 0.001
+        )
 
-        # 3. Set armature to rest position temporarily to verify
-        armature.data.pose_position = 'REST'
-        armature.data.pose_position = 'POSE'
+        if has_rotation or has_non_uniform_scale or has_location:
+            has_non_identity_transform = True
+
+        if not has_non_identity_transform:
+            self.report({'INFO'}, 'Armature transforms already at identity. '
+                                  'Export as FBX with Forward=-Z Forward, Up=Y Up, Scale=1.0')
+            return {'FINISHED'}
+
+        # Before applying transforms, we need to bake the armature's object-level
+        # animation into the bones so that data isn't lost.
+        # The key insight: when you Apply Transform on an armature object,
+        # it modifies the rest pose but doesn't update keyframed bone locations.
+        # For the ROOT bone, its world-space position comes from:
+        #   armature_object_location + root_bone_location
+        # After apply, root_bone_location must absorb the armature_object_location.
+        # But nla.bake with visual_keying handles this correctly.
+
+        # Save current action
+        original_action = None
+        if armature.animation_data and armature.animation_data.action:
+            original_action = armature.animation_data.action
+
+        if original_action:
+            # Get frame range
+            frame_start = None
+            frame_end = None
+            for fcurve in original_action.fcurves:
+                for kp in fcurve.keyframe_points:
+                    f = kp.co.x
+                    if frame_start is None or f < frame_start:
+                        frame_start = f
+                    if frame_end is None or f > frame_end:
+                        frame_end = f
+
+            if frame_start is not None and frame_end is not None:
+                frame_start = int(frame_start)
+                frame_end = int(frame_end)
+
+                # Select all bones
+                utils.set_active(armature)
+                bpy.ops.object.mode_set(mode='POSE')
+                bpy.ops.pose.select_all(action='SELECT')
+
+                # Bake with visual_keying to capture the true world-space bone positions
+                # This will correctly absorb the armature object's transforms into bone keyframes
+                bpy.ops.nla.bake(
+                    frame_start=frame_start,
+                    frame_end=frame_end,
+                    visual_keying=True,
+                    only_selected=True,
+                    use_current_action=True,
+                    bake_types={'POSE'}
+                )
+
+                bpy.ops.object.mode_set(mode='OBJECT')
+                changes_made.append('Animation baked with visual keying')
+
+        # Now apply all object transforms
+        utils.set_active(armature)
+        bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+        changes_made.append('Transforms applied (location, rotation, scale)')
+
+        # Verify the armature is at identity
+        print(f'RSL UE5 Prep: After apply - location={armature.location}, '
+              f'rotation_euler={armature.rotation_euler}, scale={armature.scale}')
 
         if changes_made:
             self.report({'INFO'}, f'UE5 prep done: {", ".join(changes_made)}. '
-                                  f'Now export as FBX with Forward=-Z, Up=Y, Scale=1.0')
+                                  f'Now export as FBX:\n'
+                                  f'  Forward: -Z Forward\n'
+                                  f'  Up: Y Up\n'
+                                  f'  Scale: 1.0\n'
+                                  f'  Apply Transform: Yes (if available)')
         else:
-            self.report({'INFO'}, 'Armature already prepared for UE5 export. '
+            self.report({'INFO'}, 'No changes needed. '
                                   'Export as FBX with Forward=-Z, Up=Y, Scale=1.0')
 
         return {'FINISHED'}
@@ -409,6 +471,18 @@ class RetargetAnimation(bpy.types.Operator):
         # We transfer it to the hip bone BEFORE any cleanup so it's preserved.
         self.transfer_armature_location_to_hip(armature_source, root_motion_bones)
 
+        # --- After transferring, remove the armature-level location fcurves ---
+        # This prevents double-movement (armature location + bone location both moving)
+        # during the retargeting process. The data is now safely on the hip bone.
+        if armature_source.animation_data and armature_source.animation_data.action:
+            fcurves_to_remove = []
+            for fcurve in armature_source.animation_data.action.fcurves:
+                if fcurve.data_path == 'location':
+                    fcurves_to_remove.append(fcurve)
+            for fcurve in fcurves_to_remove:
+                armature_source.animation_data.action.fcurves.remove(fcurve)
+                print(f'RSL: Removed armature-level location fcurve (axis {fcurve.array_index})')
+
         # Prepare armatures
         utils.set_active(armature_target)
         bpy.ops.object.mode_set(mode='OBJECT')
@@ -530,6 +604,8 @@ class RetargetAnimation(bpy.types.Operator):
             armature_target.data.bones.get(item.bone_name_target).select = True
 
         # Bake the animation to the target armature
+        # IMPORTANT: Pass root_bones_with_motion (which includes hip/root motion bones)
+        # NOT just root_bones (parentless only), otherwise hip location keyframes are stripped
         self.bake_animation(armature_source, armature_target, root_bones_with_motion)
 
         # --- Root Motion: Verify location keyframes and apply fallback if needed ---
@@ -675,7 +751,7 @@ class RetargetAnimation(bpy.types.Operator):
 
     def transfer_armature_location_to_hip(self, armature_source, root_motion_bones):
         """
-        KEY FIX: Transfer armature-object-level location keyframes to the hip bone.
+        Transfer armature-object-level location keyframes to the hip bone.
 
         When BVH files are imported into Blender, the root motion (forward walking etc.)
         is often stored as the armature OBJECT's location animation, not as a bone's
@@ -685,6 +761,9 @@ class RetargetAnimation(bpy.types.Operator):
         This method detects if the armature object has location keyframes, and if so,
         transfers them to the hip/root motion bone BEFORE any cleanup happens.
         This ensures root motion survives the retargeting process.
+
+        IMPORTANT: The armature location is in world space, but the bone location is in
+        its parent's local space. We must correctly convert between these spaces.
         """
         if not armature_source.animation_data or not armature_source.animation_data.action:
             return
@@ -720,12 +799,6 @@ class RetargetAnimation(bpy.types.Operator):
         hip_bone = armature_source.pose.bones[hip_bone_name]
         print(f'RSL: Transferring armature location to bone "{hip_bone_name}"')
 
-        # Switch to pose mode on the source armature
-        bpy.context.view_layer.objects.active = armature_source
-        if armature_source.mode != 'OBJECT':
-            bpy.ops.object.mode_set(mode='OBJECT')
-        bpy.ops.object.mode_set(mode='POSE')
-
         # Read all armature-level location keyframes
         location_data = {}  # axis -> [(frame, value)]
         for fcurve in obj_location_fcurves:
@@ -735,22 +808,106 @@ class RetargetAnimation(bpy.types.Operator):
             for kp in fcurve.keyframe_points:
                 location_data[axis].append((kp.co.x, kp.co.y))
 
-        # Get the bone's current rest location offset
-        # We need to ADD the armature location to the bone's current location
-        bone_rest_location = copy.deepcopy(hip_bone.location)
-
-        # Set location keyframes on the hip bone
-        # For each axis with armature-level data
+        # Collect all unique frames from the armature location animation
+        all_frames = set()
         for axis, keyframes in location_data.items():
-            data_path = 'location'
             for frame, value in keyframes:
-                # Set the bone's location at this frame
-                # The bone location = rest_location + armature_location_offset
-                hip_bone.location[axis] = bone_rest_location[axis] + value
-                hip_bone.keyframe_insert(data_path=data_path, index=axis, frame=frame)
+                all_frames.add(int(round(frame)))
+        all_frames = sorted(all_frames)
+
+        if not all_frames:
+            return
+
+        # Switch to pose mode on the source armature
+        bpy.context.view_layer.objects.active = armature_source
+        if armature_source.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        bpy.ops.object.mode_set(mode='POSE')
+
+        # For CORRECT space conversion, we need to:
+        # 1. Sample the armature's world-space location at each frame
+        # 2. Convert that to the bone's parent-local space
+        # 3. Subtract the bone's rest-pose offset in parent-local space
+        # This properly handles cases where the armature has rotation and
+        # the bone has a parent with a different orientation.
+
+        # Get the bone's rest pose head position in parent-local space
+        rest_head_parent_local = mathutils.Vector((0, 0, 0))
+        if hip_bone.parent:
+            parent_mat_inv = hip_bone.parent.bone.matrix_local.inverted()
+            rest_head_parent_local = (parent_mat_inv @ hip_bone.bone.matrix_local).translation
+
+        # Get armature's current object transform (rotation, scale)
+        arm_rot_euler = mathutils.Euler((0, 0, 0), 'XYZ')
+        if armature_source.rotation_mode == 'QUATERNION':
+            arm_rot_euler = armature_source.rotation_quaternion.to_euler('XYZ')
+        elif armature_source.rotation_mode == 'AXIS_ANGLE':
+            q = mathutils.Quaternion(
+                armature_source.rotation_axis_angle[1:],
+                armature_source.rotation_axis_angle[0])
+            arm_rot_euler = q.to_euler('XYZ')
+        else:
+            arm_rot_euler = armature_source.rotation_euler.copy()
+
+        arm_scale = armature_source.scale.copy()
+
+        for frame in all_frames:
+            bpy.context.scene.frame_set(frame)
+
+            # Read the armature object's animated location at this frame
+            arm_location = mathutils.Vector((0, 0, 0))
+            for axis, keyframes in location_data.items():
+                # Evaluate the fcurve at this frame for smooth interpolation
+                for fcurve in obj_location_fcurves:
+                    if fcurve.array_index == axis:
+                        arm_location[axis] = fcurve.evaluate(frame)
+                        break
+
+            # The armature object's world location = arm_location + base_location
+            # But for the bone in parent-local space, we need:
+            # bone_head_world = armature_matrix_world @ bone_head_local_in_armature
+            # armature_matrix_world includes: arm_location, arm_rotation, arm_scale
+
+            # Compute what the armature's world transform is at this frame
+            arm_matrix_world = mathutils.Matrix.LocRotScale(arm_location, arm_rot_euler, arm_scale)
+
+            # Compute the bone's world head position WITH the armature location offset
+            bone_head_in_armature = hip_bone.bone.matrix_local.translation
+            bone_head_world_with_offset = arm_matrix_world @ bone_head_in_armature
+
+            # Convert to parent-local space
+            if hip_bone.parent:
+                # The parent bone's world matrix (without the armature location offset,
+                # since we only want the location delta from armature movement)
+                parent_head_world_no_offset = armature_source.matrix_world @ hip_bone.parent.bone.matrix_local.translation
+                # Actually we need the full parent bone world transform
+                # But since the parent may also be animated, let's use the current depsgraph
+                # For simplicity and correctness, compute the offset in armature-local space
+
+                # In armature-local space, the offset from armature location is simply arm_location
+                # rotated by the armature's rotation and scaled
+                # Then convert to parent-local space
+                parent_mat_inv = hip_bone.parent.bone.matrix_local.inverted()
+                # The delta in armature-local space is: arm_rot_mat @ arm_loc
+                # (armature rotation affects how the location maps to armature space)
+                arm_rot_mat = arm_rot_euler.to_matrix().to_4x4()
+                arm_loc_in_arm_space = arm_rot_mat @ mathutils.Vector(arm_location) * arm_scale.x
+
+                # Convert this armature-space delta to parent-local space
+                location_offset_parent_local = parent_mat_inv @ arm_loc_in_arm_space
+                new_bone_location = rest_head_parent_local + location_offset_parent_local.translation
+            else:
+                # No parent: bone location is in armature-local space directly
+                arm_rot_mat = arm_rot_euler.to_matrix().to_4x4()
+                arm_loc_in_arm_space = arm_rot_mat @ mathutils.Vector(arm_location) * arm_scale.x
+                new_bone_location = rest_head_parent_local + arm_loc_in_arm_space
+
+            hip_bone.location = new_bone_location
+            hip_bone.keyframe_insert(data_path='location', frame=frame)
 
         bpy.ops.object.mode_set(mode='OBJECT')
-        print(f'RSL: Armature location transferred to "{hip_bone_name}" successfully')
+        print(f'RSL: Armature location transferred to "{hip_bone_name}" successfully '
+              f'({len(all_frames)} keyframes, with space conversion)')
 
     def find_hip_bone_by_name(self, armature):
         """Find a hip-like bone by checking its name against common patterns."""
@@ -924,19 +1081,19 @@ class RetargetAnimation(bpy.types.Operator):
 
     def clean_animation(self, armature_source):
         """Remove armature-object-level animation fcurves that interfere with auto-scaling.
-        
-        NOTE: Only removes rotation and scale at the object level.
-        Location fcurves at the object level are NO LONGER removed because they
-        often contain root motion data from BVH imports. The location data is
-        transferred to the hip bone by transfer_armature_location_to_hip() before
-        this method is called.
+
+        All object-level fcurves are removed including location, because:
+        - Location data has already been transferred to the hip bone by
+          transfer_armature_location_to_hip() if it contained root motion
+        - Remaining object-level animation interferes with the retargeting process
         """
-        # Only remove rotation and scale at armature level - NOT location
-        # Location may contain root motion data that was already transferred to hip bone
-        deletable_fcurves = ['rotation_euler', 'rotation_quaternion', 'scale']
+        deletable_fcurves = ['rotation_euler', 'rotation_quaternion', 'scale', 'location']
+        fcurves_to_remove = []
         for fcurve in armature_source.animation_data.action.fcurves:
             if fcurve.data_path in deletable_fcurves:
-                armature_source.animation_data.action.fcurves.remove(fcurve)
+                fcurves_to_remove.append(fcurve)
+        for fcurve in fcurves_to_remove:
+            armature_source.animation_data.action.fcurves.remove(fcurve)
 
     def get_and_reset_pose_rotations(self, armature):
         bpy.ops.object.select_all(action='DESELECT')
@@ -1062,10 +1219,17 @@ class RetargetAnimation(bpy.types.Operator):
         return source_armature_copy
 
     def bake_animation(self, armature_source, armature_target, root_bones):
+        """Bake the visual pose of the target armature to keyframes.
+
+        root_bones: list of bone names whose LOCATION keyframes should be preserved.
+        This includes both parentless root bones AND root motion bones (like hips).
+        """
         frame_split = 25
         frame_start, frame_end = self.read_anim_start_end(armature_source)
         frame_start, frame_end = int(frame_start), int(frame_end)
         utils.set_active(armature_target)
+
+        print(f'RSL bake_animation: root_bones (location preserved) = {root_bones}')
 
         actions_all = []
 
@@ -1123,6 +1287,8 @@ class RetargetAnimation(bpy.types.Operator):
                 # Keep location keyframes for root bones AND root motion bones
                 if bone_name[1] not in root_bones:
                     continue
+                else:
+                    print(f'RSL bake: Preserving location for bone "{bone_name[1]}" (in root_bones list)')
 
             curve_final = action_final.fcurves.new(data_path=fcurve.data_path, index=fcurve.array_index, action_group=fcurve.group.name)
             keyframe_points = curve_final.keyframe_points

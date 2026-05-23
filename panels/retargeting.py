@@ -145,7 +145,11 @@ class RetargetingPanel(ToolPanel, bpy.types.Panel):
 
         row = layout.row(align=True)
         row.scale_y = 0.7
-        row.label(text='  Apply before FBX export', icon='INFO')
+        row.label(text='  Bake transforms & apply before FBX export', icon='INFO')
+
+        row = layout.row(align=True)
+        row.scale_y = 0.7
+        row.label(text='  FBX settings: Forward=-Z, Up=Y, Scale=1.0', icon='INFO')
 
         self.draw_import_export(layout)
 
