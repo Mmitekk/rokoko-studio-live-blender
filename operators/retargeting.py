@@ -756,23 +756,26 @@ class RetargetAnimation(bpy.types.Operator):
         # NOT just root_bones (parentless only), otherwise hip location keyframes are stripped
         self.bake_animation(armature_source, armature_target, root_bones_with_motion)
 
-        # --- Root Motion: Verify location keyframes and apply fallback if needed ---
+        # --- Root Motion: Post-bake processing ---
+        # After baking with COPY_LOCATION constraints, the situation is:
+        #
+        # Common case (BVH import where source root = source hips):
+        #   ROOT (parentless) already HAS walking motion from COPY_LOCATION → correct
+        #   HIPS (child of ROOT) has near-constant location → just offsets rest pose
+        #   → No extraction needed, just zero out HIPS location
+        #
+        # Rare case (source has separate Root and Hips):
+        #   ROOT (parentless) has NO walking motion (source root is static)
+        #   HIPS (child of ROOT) HAS walking motion from COPY_LOCATION
+        #   → Need to extract from HIPS to ROOT
+        #
+        # The previous code checked HIPS for motion and used a fallback that
+        # ADDED motion to HIPS, then extracted → this caused double/incorrect motion.
         if root_motion_bones:
-            location_verified = self.verify_root_motion_location(armature_target, root_motion_bones)
-            if not location_verified:
-                print('RSL WARNING: Root motion location keyframes missing after bake. Applying direct transfer fallback...')
-                self.transfer_root_motion_direct(armature_source, armature_target, root_motion_bones, root_bones_with_motion)
-
-        # --- Root Motion: Extract root motion from HIPS to parentless ROOT bone ---
-        # UE5 extracts root motion from the parentless ROOT bone, not from HIPS.
-        # After baking, the HIPS bone has the forward walking location data, but UE5
-        # needs it on the ROOT bone. This method transfers the motion correctly.
-        if root_motion_bones:
-            self.extract_root_motion_to_root_bone(armature_target, root_motion_bones, root_bones)
-
-        # --- Root Motion: Apply rest pose offset to baked location keyframes ---
-        if root_motion_bones and context.scene.rsl_retargeting_root_motion_keep_offset:
-            self.apply_root_motion_offset(armature_target, root_motion_rest_offsets)
+            self.process_root_motion_after_bake(
+                armature_target, root_motion_bones, root_bones,
+                context.scene.rsl_retargeting_root_motion_keep_offset,
+                root_motion_rest_offsets)
 
         # Delete the duplicate helper armature
         bpy.ops.object.select_all(action='DESELECT')
@@ -1162,6 +1165,119 @@ class RetargetAnimation(bpy.types.Operator):
                 all_ok = False
 
         return all_ok
+
+    def process_root_motion_after_bake(self, armature_target, root_motion_bones,
+                                        root_bones, keep_offset, root_motion_rest_offsets):
+        """
+        Post-bake processing for root motion.
+
+        After baking, the ROOT bone (parentless) may already have location animation
+        from COPY_LOCATION. In BVH imports where source root = source hips, the ROOT
+        bone gets the walking motion directly. HIPS (child of ROOT) has near-constant
+        location because ROOT already carries the motion.
+
+        In rare cases where source has separate Root and Hips bones, ROOT has no
+        motion but HIPS does. Then we need to extract from HIPS to ROOT.
+
+        This method handles both cases correctly.
+        """
+        if not armature_target.animation_data or not armature_target.animation_data.action:
+            print('RSL Root Motion Process: No animation data')
+            return
+
+        action = armature_target.animation_data.action
+
+        # Find the parentless ROOT bone
+        root_bone_name = ''
+        for bone_name in root_bones:
+            bone = armature_target.pose.bones.get(bone_name)
+            if bone and not bone.parent:
+                root_bone_name = bone_name
+                break
+
+        # Get the HIPS bone name
+        hips_bone_name = ''
+        for rm_target in root_motion_bones:
+            hips_bone_name = rm_target
+            break
+
+        if not root_bone_name:
+            print('RSL Root Motion Process: No parentless root bone found')
+            return
+
+        if not hips_bone_name:
+            print('RSL Root Motion Process: No hips bone found')
+            return
+
+        # Check if ROOT has location animation with actual movement
+        root_has_motion = False
+        root_loc_fcurves = []
+        for fcurve in action.fcurves:
+            if fcurve.data_path == f'pose.bones["{root_bone_name}"].location':
+                root_loc_fcurves.append(fcurve)
+
+        if len(root_loc_fcurves) >= 3:
+            for fc in root_loc_fcurves:
+                values = [kp.co.y for kp in fc.keyframe_points]
+                if len(values) > 1 and abs(max(values) - min(values)) > 0.001:
+                    root_has_motion = True
+                    break
+
+        print(f'RSL Root Motion Process: ROOT="{root_bone_name}" has_motion={root_has_motion}, '
+              f'HIPS="{hips_bone_name}"')
+
+        if root_has_motion:
+            # CASE 1: ROOT already has walking motion (common BVH case)
+            # Just zero out HIPS location to prevent double motion
+            print(f'RSL Root Motion: ROOT "{root_bone_name}" already has location motion. '
+                  f'Zeroing out HIPS location to prevent double motion.')
+            self.zero_bone_location(action, armature_target, hips_bone_name)
+        else:
+            # CASE 2: ROOT has no motion, HIPS might have it (rare case)
+            # Need to extract from HIPS to ROOT
+            hips_has_motion = False
+            hips_loc_fcurves = []
+            for fcurve in action.fcurves:
+                if fcurve.data_path == f'pose.bones["{hips_bone_name}"].location':
+                    hips_loc_fcurves.append(fcurve)
+
+            if len(hips_loc_fcurves) >= 3:
+                for fc in hips_loc_fcurves:
+                    values = [kp.co.y for kp in fc.keyframe_points]
+                    if len(values) > 1 and abs(max(values) - min(values)) > 0.001:
+                        hips_has_motion = True
+                        break
+
+            if hips_has_motion:
+                print(f'RSL Root Motion: ROOT has no motion, extracting from HIPS '
+                      f'"{hips_bone_name}" to ROOT "{root_bone_name}"')
+                self.extract_root_motion_to_root_bone(armature_target, root_motion_bones, root_bones)
+            else:
+                # Neither ROOT nor HIPS has motion - something went wrong
+                print(f'RSL Root Motion WARNING: Neither ROOT nor HIPS has location animation!')
+                print(f'  ROOT fcurves: {len(root_loc_fcurves)}, HIPS fcurves: {len(hips_loc_fcurves)}')
+
+        # Apply rest pose offset
+        if keep_offset and root_motion_rest_offsets:
+            self.apply_root_motion_offset(armature_target, root_motion_rest_offsets)
+
+    def zero_bone_location(self, action, armature, bone_name):
+        """Remove all location keyframes for a bone (set to zero/remove)."""
+        fcurves_to_remove = []
+        for fcurve in action.fcurves:
+            if fcurve.data_path == f'pose.bones["{bone_name}"].location':
+                fcurves_to_remove.append(fcurve)
+
+        for fcurve in fcurves_to_remove:
+            action.fcurves.remove(fcurve)
+
+        # Also clear the pose bone's current location
+        bone = armature.pose.bones.get(bone_name)
+        if bone:
+            bone.location = (0, 0, 0)
+
+        if fcurves_to_remove:
+            print(f'RSL: Removed {len(fcurves_to_remove)} location fcurves from "{bone_name}"')
 
     def extract_root_motion_to_root_bone(self, armature_target, root_motion_bones, root_bones):
         """
