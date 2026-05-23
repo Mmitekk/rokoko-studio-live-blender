@@ -199,9 +199,9 @@ class ExportFBXForUE5(bpy.types.Operator):
     This operator automates the entire export workflow without modifying the
     original armature:
       1. Duplicates the armature + child meshes together
-      2. Samples root bone world positions BEFORE transform_apply
+      2. Saves the armature's rotation+scale matrix BEFORE transform_apply
       3. Applies all object transforms on the copies (bakes rotation/scale into bones)
-      4. Corrects root bone location keyframes using sampled world positions
+      4. Corrects root bone location keyframes using the saved rotation matrix
       5. Removes ALL object-level animation keyframes from the copy
       6. Exports as FBX with UE5-compatible settings (Forward=-Z, Up=Y)
       7. Deletes the temporary copies
@@ -210,12 +210,23 @@ class ExportFBXForUE5(bpy.types.Operator):
     is exported as armature_nodetype='NULL', so UE5 treats the first real bone
     (e.g. mixamorig:Hips) as the skeleton root. This ensures both root motion
     extraction and Force Root Lock work correctly in UE5.
+
+    WHY THE ROTATION MATRIX CORRECTION IS NEEDED:
+    After transform_apply, the bone rest poses are rotated to absorb the
+    armature's rotation, but the bone's LOCATION keyframes are NOT adjusted
+    by Blender. For a parentless bone, bone.location is in armature space.
+    After apply, armature space = world space, but the old location values
+    are in the old rotated armature space. The correction transforms them:
+        new_bone_location = old_rotation_scale_matrix @ old_bone_location
+    This preserves the visual position because:
+        old_visual = R @ S @ (head + loc) + L = R @ S @ head + R @ S @ loc + L
+        new_visual = (R@S@head + L) + R@S@loc = same ✓
     """
     bl_idname = "rsl.export_fbx_ue5"
     bl_label = "Export FBX"
     bl_description = ('One-click export to UE5-ready FBX. Applies transforms on a '
-                      'temporary copy, exports with Forward=-Z / Up=Y (armature as NULL), '
-                      'and cleans up. Root motion stays on the bone for correct Force Root Lock.')
+                      'temporary copy, corrects root bone location, and exports '
+                      'with armature as NULL for correct Force Root Lock.')
     bl_options = {'REGISTER', 'UNDO'}
 
     filepath: bpy.props.StringProperty(subtype='FILE_PATH')
@@ -263,14 +274,13 @@ class ExportFBXForUE5(bpy.types.Operator):
         armature_copy = context.active_object
         mesh_copies = [obj for obj in context.selected_objects if obj.type == 'MESH']
 
-        # --- Step 2: Sample root bone world positions BEFORE transform_apply ---
-        # We must sample the bone's actual world position at each frame BEFORE
-        # applying any transforms, because transform_apply(rotation=True) changes
-        # the bone rest poses but does NOT adjust animation keyframes. This means
-        # bone.location values after transform_apply are in the old armature-local
-        # space, not world space. By sampling before apply, we get correct world
-        # positions that we can then use to set the armature's location animation.
-        root_bone_world_positions = self._sample_root_bone_world_positions(armature_copy)
+        # --- Step 2: Save the armature's rotation+scale matrix BEFORE transform_apply ---
+        # After transform_apply, the bone rest poses absorb the armature's rotation
+        # and scale, but the bone's LOCATION keyframes are NOT adjusted. We need
+        # the 3x3 rotation+scale matrix to correct them afterwards.
+        # new_bone_location = saved_rot_scale @ old_bone_location
+        saved_rot_scale = armature_copy.matrix_world.to_3x3().copy()
+        print(f'RSL Export: Saved armature rotation+scale matrix:\n{saved_rot_scale}')
 
         # --- Step 3: Apply ALL transforms on the copies ---
         # This bakes the armature's rotation (e.g. -90 deg X from BVH import)
@@ -284,19 +294,11 @@ class ExportFBXForUE5(bpy.types.Operator):
             utils.set_active(mesh)
             bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
 
-        # --- Step 4: Correct root bone location after transform_apply ---
-        # After transform_apply, the armature is at identity, but the bone's
-        # location keyframes are in the OLD armature-local space and are now
-        # WRONG. We must recompute them using the world positions sampled
-        # BEFORE transform_apply.
-        #
-        # We keep the root motion ON THE BONE (not the armature object) and
-        # export with armature_nodetype='NULL'. This way:
-        #   - UE5 treats the armature as a helper node (not a bone)
-        #   - UE5 uses the first real bone (e.g. mixamorig:Hips) as the root
-        #   - Root motion extraction works from the real bone
-        #   - Force Root Lock works correctly (no axis conversion rotation issues)
-        self._correct_root_bone_location(armature_copy, root_bone_world_positions)
+        # --- Step 4: Correct root bone location using the saved rotation+scale matrix ---
+        # After transform_apply, the armature is at identity. The bone's location
+        # keyframes are still in the OLD armature space. We multiply each keyframe
+        # value by the saved R@S matrix to convert to the new armature space.
+        self._correct_root_bone_location(armature_copy, saved_rot_scale)
 
         # --- Step 5: Remove ALL object-level animation fcurves ---
         # After applying transforms, the armature object is at identity.
@@ -407,104 +409,30 @@ class ExportFBXForUE5(bpy.types.Operator):
         return {'FINISHED'}
 
     @staticmethod
-    def _sample_root_bone_world_positions(armature):
+    def _correct_root_bone_location(armature, saved_rot_scale):
         """
-        Sample the root bone's world position at every frame of the animation
-        using depsgraph evaluation. Must be called BEFORE transform_apply.
+        Correct the parentless root bone's location keyframes after transform_apply.
 
-        Returns: dict {frame: mathutils.Vector} or empty dict if no animation
+        After transform_apply(rotation+scale), the bone rest poses absorb the
+        armature's rotation and scale, but the bone's LOCATION keyframes are NOT
+        adjusted by Blender. They remain in the OLD armature space.
+
+        For a parentless bone, bone.location is in armature space. After apply,
+        the new armature space is aligned with world space (identity). The old
+        values need to be transformed by the armature's old rotation+scale matrix:
+
+            new_bone_location = saved_rot_scale @ old_bone_location
+
+        This preserves the visual position because:
+            old_visual = R@S @ (head + loc) + L = R@S@head + R@S@loc + L
+            new_visual = (R@S@head + L) + R@S@loc = same ✓
+
+        Parameters:
+          armature: The armature (after transform_apply, at identity)
+          saved_rot_scale: The 3x3 rotation+scale matrix saved BEFORE apply
         """
         if not armature.animation_data or not armature.animation_data.action:
-            print('RSL Export: No animation data - cannot sample root bone positions')
-            return {}
-
-        action = armature.animation_data.action
-
-        # Find the parentless root bone
-        root_bone_name = ''
-        for bone in armature.pose.bones:
-            if not bone.parent:
-                root_bone_name = bone.name
-                break
-
-        if not root_bone_name:
-            print('RSL Export: No parentless root bone found - cannot sample')
-            return {}
-
-        # Get the animation frame range
-        frame_start = None
-        frame_end = None
-        for fcurve in action.fcurves:
-            for kp in fcurve.keyframe_points:
-                f = kp.co.x
-                if frame_start is None or f < frame_start:
-                    frame_start = f
-                if frame_end is None or f > frame_end:
-                    frame_end = f
-
-        if frame_start is None:
-            return {}
-
-        frame_start = int(frame_start)
-        frame_end = int(frame_end)
-
-        print(f'RSL Export: Sampling root bone "{root_bone_name}" world positions '
-              f'(frames {frame_start}-{frame_end})')
-
-        # Switch to object mode for depsgraph evaluation
-        bpy.context.view_layer.objects.active = armature
-        if armature.mode != 'OBJECT':
-            bpy.ops.object.mode_set(mode='OBJECT')
-
-        # Sample the bone's world position at each frame
-        world_positions = {}
-        for frame in range(frame_start, frame_end + 1):
-            bpy.context.scene.frame_set(frame)
-            depsgraph = bpy.context.evaluated_depsgraph_get()
-            armature_eval = armature.evaluated_get(depsgraph)
-            root_bone_eval = armature_eval.pose.bones.get(root_bone_name)
-            if root_bone_eval:
-                # The bone's head position in world space
-                world_pos = armature_eval.matrix_world @ root_bone_eval.head.copy()
-                world_positions[frame] = world_pos
-            else:
-                # Fallback
-                root_bone = armature.pose.bones[root_bone_name]
-                world_pos = armature.matrix_world @ root_bone.head.copy()
-                world_positions[frame] = world_pos
-
-        print(f'RSL Export: Sampled {len(world_positions)} frames. '
-              f'First: {world_positions[frame_start]}, '
-              f'Last: {world_positions[frame_end]}')
-
-        return world_positions
-
-    @staticmethod
-    def _correct_root_bone_location(armature, root_bone_world_positions):
-        """
-        Correct the root bone's location keyframes after transform_apply.
-
-        After transform_apply(rotation=True, location=True, scale=True), the armature
-        object is at identity transform. However, the bone's location keyframes are
-        still in the OLD armature-local space and are now INCORRECT because the
-        armature's rotation was baked into the bone rest poses.
-
-        This method recomputes the root bone's location keyframes using the world
-        positions sampled BEFORE transform_apply, so the bone's visual world position
-        is preserved:
-            bone.location = world_pos_sampled - bone.head_local_after_apply
-
-        The root motion stays ON THE BONE (not transferred to armature object).
-        With armature_nodetype='NULL', UE5 treats the armature as a helper node
-        and uses the root bone (e.g. mixamorig:Hips) as the skeleton root.
-        This ensures Force Root Lock works correctly in UE5.
-        """
-        if not root_bone_world_positions:
-            print('RSL Export: No root bone world positions - skipping correction')
-            return
-
-        if not armature.animation_data or not armature.animation_data.action:
-            print('RSL Export: No animation data - skipping correction')
+            print('RSL Export: No animation data - skipping location correction')
             return
 
         action = armature.animation_data.action
@@ -520,76 +448,84 @@ class ExportFBXForUE5(bpy.types.Operator):
             print('RSL Export: No parentless root bone found - skipping correction')
             return
 
-        root_bone = armature.pose.bones[root_bone_name]
+        data_path = f'pose.bones["{root_bone_name}"].location'
 
-        # After transform_apply(all), armature is at origin with identity rotation.
-        # bone.head_local is the rest head position in the new armature space.
-        bone_rest_head = root_bone.bone.head_local.copy()
+        # Collect the 3 location fcurves
+        loc_fcurves = [None, None, None]
+        for fcurve in action.fcurves:
+            if fcurve.data_path == data_path:
+                if 0 <= fcurve.array_index <= 2:
+                    loc_fcurves[fcurve.array_index] = fcurve
 
-        print(f'RSL Export: Root bone "{root_bone_name}" rest head after apply: {bone_rest_head}')
+        if not any(loc_fcurves):
+            print(f'RSL Export: No location fcurves for "{root_bone_name}" - skipping')
+            return
 
-        # Compute corrected bone location at each frame:
-        # bone.location = world_pos - bone_rest_head
-        # This preserves the visual position because:
-        #   new_world_pos = armature.matrix_world @ (bone_rest_head + bone.location)
-        #                = identity @ (bone_rest_head + (world_pos - bone_rest_head))
-        #                = world_pos  ✓
-        bone_locations = {}
-        for frame, world_pos in root_bone_world_positions.items():
-            bone_locations[frame] = world_pos - bone_rest_head
+        # Read all keyframe values from the 3 location fcurves
+        frame_data = {}  # {frame: [x, y, z]}
+        for axis in range(3):
+            fc = loc_fcurves[axis]
+            if fc:
+                for kp in fc.keyframe_points:
+                    frame = int(round(kp.co.x))
+                    if frame not in frame_data:
+                        frame_data[frame] = [0.0, 0.0, 0.0]
+                    frame_data[frame][axis] = kp.co.y
 
-        # Debug: show the displacement
-        frames = sorted(bone_locations.keys())
-        if len(frames) > 1:
-            first_loc = bone_locations[frames[0]]
-            last_loc = bone_locations[frames[-1]]
+        if not frame_data:
+            print(f'RSL Export: No location keyframes for "{root_bone_name}" - skipping')
+            return
+
+        # Transform each frame's location by the saved rotation+scale matrix
+        from mathutils import Vector
+        max_displacement = 0.0
+        first_loc = None
+        last_loc = None
+        for frame in sorted(frame_data.keys()):
+            old_loc = Vector(frame_data[frame])
+            new_loc = saved_rot_scale @ old_loc
+            frame_data[frame] = new_loc
+
+            if first_loc is None:
+                first_loc = new_loc.copy()
+            last_loc = new_loc.copy()
+
+        if first_loc and last_loc:
             delta = last_loc - first_loc
-            print(f'RSL Export: Root bone location delta ({frames[0]}→{frames[-1]}): {delta}')
+            max_displacement = delta.length
+            print(f'RSL Export: Root bone "{root_bone_name}" location delta: {delta}')
             print(f'RSL Export: Delta length: {delta.length:.4f}')
 
-        # Remove existing bone location fcurves and recreate with correct values
-        root_loc_fcurves = []
-        for fcurve in action.fcurves:
-            if fcurve.data_path == f'pose.bones["{root_bone_name}"].location':
-                root_loc_fcurves.append(fcurve)
+        # Remove old fcurves
+        for fc in loc_fcurves:
+            if fc:
+                action.fcurves.remove(fc)
 
-        for fcurve in root_loc_fcurves:
-            action.fcurves.remove(fcurve)
-
-        # Create new bone location fcurves with corrected values
-        loc_fcurves = {}
+        # Create new fcurves with corrected values
+        new_fcurves = {}
         for axis in range(3):
-            fc = action.fcurves.new(
-                data_path=f'pose.bones["{root_bone_name}"].location',
-                index=axis)
-            loc_fcurves[axis] = fc
+            fc = action.fcurves.new(data_path=data_path, index=axis)
+            new_fcurves[axis] = fc
 
-        # Populate bone location keyframes
-        for frame in sorted(bone_locations.keys()):
-            loc = bone_locations[frame]
+        # Populate with transformed values
+        for frame in sorted(frame_data.keys()):
+            loc = frame_data[frame]
             for axis in range(3):
-                fc = loc_fcurves[axis]
-                fc.keyframe_points.insert(frame, loc[axis])
+                new_fcurves[axis].keyframe_points.insert(frame, loc[axis])
 
-        # Update fcurve handles
-        for axis, fc in loc_fcurves.items():
+        # Update fcurves
+        for fc in new_fcurves.values():
             fc.update()
 
-        # Set the bone's current location to the first frame value
-        if frames:
-            root_bone.location = bone_locations[frames[0]]
+        # Update the bone's current location
+        root_bone = armature.pose.bones[root_bone_name]
+        min_frame = min(frame_data.keys())
+        root_bone.location = frame_data[min_frame]
 
-        # Verify
-        max_displacement = 0.0
-        if len(frames) > 1:
-            first_loc = bone_locations[frames[0]]
-            last_loc = bone_locations[frames[-1]]
-            max_displacement = (last_loc - first_loc).length
-
-        print(f'RSL Export: Root bone location corrected '
-              f'({len(bone_locations)} keyframes, displacement={max_displacement:.4f})')
-        print(f'RSL Export: Bone location at frame {frames[0]}: {bone_locations[frames[0]]}')
-        print(f'RSL Export: Bone location at frame {frames[-1]}: {bone_locations[frames[-1]]}')
+        print(f'RSL Export: Root bone "{root_bone_name}" location corrected '
+              f'({len(frame_data)} keyframes, displacement={max_displacement:.4f})')
+        print(f'RSL Export: First frame loc: {first_loc}')
+        print(f'RSL Export: Last frame loc: {last_loc}')
 
     @staticmethod
     def _cleanup(armature_copy, mesh_copies):
