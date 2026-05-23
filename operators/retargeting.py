@@ -296,14 +296,17 @@ class ExportFBXForUE5(bpy.types.Operator):
         # retargets and NLA bakes and cause the "7 animations" issue in UE5.
         current_action = armature_copy.animation_data.action if armature_copy.animation_data else None
         for action in list(bpy.data.actions):
-            # Never remove the action currently assigned to our export copy
-            if action == current_action:
-                continue
-            # Count real users (subtract 1 for fake_user if set)
-            real_users = action.users - (1 if action.use_fake_user else 0)
-            if real_users <= 0:
-                action.use_fake_user = False
-                bpy.data.actions.remove(action)
+            try:
+                # Never remove the action currently assigned to our export copy
+                if action == current_action:
+                    continue
+                # Count real users (subtract 1 for fake_user if set)
+                real_users = action.users - (1 if action.use_fake_user else 0)
+                if real_users <= 0:
+                    action.use_fake_user = False
+                    bpy.data.actions.remove(action)
+            except ReferenceError:
+                pass  # Action was already removed by Blender
 
         # --- Step 4: Select all copies for export ---
         bpy.ops.object.select_all(action='DESELECT')
@@ -618,12 +621,15 @@ class RetargetAnimation(bpy.types.Operator):
         # from previous retargeting runs. This is critical to prevent the FBX
         # exporter from including stale animations.
         for action in list(bpy.data.actions):
-            # Don't remove actions that are currently assigned to objects
-            real_users = action.users - (1 if action.use_fake_user else 0)
-            if real_users <= 0:
-                action.use_fake_user = False
-                bpy.data.actions.remove(action)
-                print(f'RSL: Removed orphaned action "{action.name}"')
+            try:
+                real_users = action.users - (1 if action.use_fake_user else 0)
+                if real_users <= 0:
+                    name = action.name  # Save name before removal
+                    action.use_fake_user = False
+                    bpy.data.actions.remove(action)
+                    print(f'RSL: Removed orphaned action "{name}"')
+            except ReferenceError:
+                pass  # Action was already removed by Blender
 
         # Prepare armatures
         utils.set_active(armature_target)
@@ -787,11 +793,14 @@ class RetargetAnimation(bpy.types.Operator):
         # REAL users (i.e. they're only alive because of the fake_user flag).
         # These accumulate from repeated retargets and NLA bakes.
         for action in list(bpy.data.actions):
-            # Count real users (subtract 1 for fake_user if set)
-            real_users = action.users - (1 if action.use_fake_user else 0)
-            if real_users <= 0:
-                action.use_fake_user = False
-                bpy.data.actions.remove(action)
+            try:
+                # Count real users (subtract 1 for fake_user if set)
+                real_users = action.users - (1 if action.use_fake_user else 0)
+                if real_users <= 0:
+                    action.use_fake_user = False
+                    bpy.data.actions.remove(action)
+            except ReferenceError:
+                pass  # Action was already removed by Blender
 
         # Remove constraints from target armature
         for bone in armature_target.pose.bones:
