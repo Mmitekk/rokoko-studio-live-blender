@@ -199,18 +199,23 @@ class ExportFBXForUE5(bpy.types.Operator):
     This operator automates the entire export workflow without modifying the
     original armature:
       1. Duplicates the armature + child meshes together
-      2. Applies all object transforms on the copies (bakes rotation/scale into bones)
-      3. Removes object-level animation keyframes from the copy
-      4. Exports as FBX with UE5-compatible settings (Forward=-Z, Up=Y)
-      5. Deletes the temporary copies
+      2. Samples root bone world positions BEFORE transform_apply
+      3. Applies all object transforms on the copies (bakes rotation/scale into bones)
+      4. Corrects root bone location keyframes using sampled world positions
+      5. Removes ALL object-level animation keyframes from the copy
+      6. Exports as FBX with UE5-compatible settings (Forward=-Z, Up=Y)
+      7. Deletes the temporary copies
 
-    The FBX file will import into UE5 at the correct scale and orientation.
+    Root motion is kept ON THE BONE (not the armature object). The armature
+    is exported as armature_nodetype='NULL', so UE5 treats the first real bone
+    (e.g. mixamorig:Hips) as the skeleton root. This ensures both root motion
+    extraction and Force Root Lock work correctly in UE5.
     """
     bl_idname = "rsl.export_fbx_ue5"
     bl_label = "Export FBX"
     bl_description = ('One-click export to UE5-ready FBX. Applies transforms on a '
-                      'temporary copy, exports with Forward=-Z / Up=Y, and cleans up. '
-                      'Original armature is not modified.')
+                      'temporary copy, exports with Forward=-Z / Up=Y (armature as NULL), '
+                      'and cleans up. Root motion stays on the bone for correct Force Root Lock.')
     bl_options = {'REGISTER', 'UNDO'}
 
     filepath: bpy.props.StringProperty(subtype='FILE_PATH')
@@ -279,32 +284,28 @@ class ExportFBXForUE5(bpy.types.Operator):
             utils.set_active(mesh)
             bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
 
-        # --- Step 4: Transfer root bone world positions → armature object location ---
-        # CRITICAL for UE5 root motion:
-        # When Blender's FBX exporter creates the FBX file, it creates an
-        # armature node ABOVE the bone hierarchy. UE5 treats this armature
-        # node as the "root bone" of the skeleton. If this root node has no
-        # animation, UE5's root motion extraction finds nothing.
+        # --- Step 4: Correct root bone location after transform_apply ---
+        # After transform_apply, the armature is at identity, but the bone's
+        # location keyframes are in the OLD armature-local space and are now
+        # WRONG. We must recompute them using the world positions sampled
+        # BEFORE transform_apply.
         #
-        # We sampled the bone's world position BEFORE transform_apply (when the
-        # visual result was still correct). After transform_apply(all), the armature
-        # is at origin with identity rotation. We set armature.location so that
-        # the bone's world position is preserved:
-        #   armature.location = world_pos_sampled - bone.head_local_after_apply
-        #   bone.location = 0
-        # Then: new_world_pos = armature.location + bone.head_local + 0 = world_pos ✓
-        #
-        # The FBX exporter will apply the object-level axis conversion to
-        # armature.location, producing correct root motion in UE5.
-        self._transfer_root_motion_to_armature_object(armature_copy, root_bone_world_positions)
+        # We keep the root motion ON THE BONE (not the armature object) and
+        # export with armature_nodetype='NULL'. This way:
+        #   - UE5 treats the armature as a helper node (not a bone)
+        #   - UE5 uses the first real bone (e.g. mixamorig:Hips) as the root
+        #   - Root motion extraction works from the real bone
+        #   - Force Root Lock works correctly (no axis conversion rotation issues)
+        self._correct_root_bone_location(armature_copy, root_bone_world_positions)
 
-        # --- Step 5: Remove object-level ROTATION and SCALE animation fcurves ---
-        # After applying transforms, any rotation/scale keyframes are stale.
-        # We KEEP the location animation (it now carries the root motion).
+        # --- Step 5: Remove ALL object-level animation fcurves ---
+        # After applying transforms, the armature object is at identity.
+        # All object-level keyframes are stale. Root motion is on the BONE,
+        # not the armature object, so we remove everything.
         if armature_copy.animation_data and armature_copy.animation_data.action:
             fcurves_to_remove = []
             for fcurve in armature_copy.animation_data.action.fcurves:
-                if fcurve.data_path in ('rotation_euler', 'rotation_quaternion',
+                if fcurve.data_path in ('location', 'rotation_euler', 'rotation_quaternion',
                                         'rotation_axis_angle', 'scale'):
                     fcurves_to_remove.append(fcurve)
             for fcurve in fcurves_to_remove:
@@ -358,7 +359,7 @@ class ExportFBXForUE5(bpy.types.Operator):
                 use_mesh_vertices=False,
                 primary_bone_axis='Y',
                 secondary_bone_axis='X',
-                armature_nodetype='ROOT',
+                armature_nodetype='NULL',
                 bake_space_transform=False,
                 object_types={'ARMATURE', 'MESH'},
             )
@@ -381,7 +382,7 @@ class ExportFBXForUE5(bpy.types.Operator):
                     bake_anim_use_all_actions=False,
                     primary_bone_axis='Y',
                     secondary_bone_axis='X',
-                    armature_nodetype='ROOT',
+                    armature_nodetype='NULL',
                     object_types={'ARMATURE', 'MESH'},
                 )
                 print(f'RSL Export FBX (compat mode): Exported to "{filepath}"')
@@ -479,31 +480,31 @@ class ExportFBXForUE5(bpy.types.Operator):
         return world_positions
 
     @staticmethod
-    def _transfer_root_motion_to_armature_object(armature, root_bone_world_positions):
+    def _correct_root_bone_location(armature, root_bone_world_positions):
         """
-        Transfer root bone world positions to the armature OBJECT's location animation.
+        Correct the root bone's location keyframes after transform_apply.
 
-        UE5 root motion extraction uses the topmost bone in the skeleton hierarchy.
-        When Blender exports FBX, the armature object becomes a root node ABOVE all
-        bones. If this root node has no animation, UE5's root motion extraction fails.
+        After transform_apply(rotation=True, location=True, scale=True), the armature
+        object is at identity transform. However, the bone's location keyframes are
+        still in the OLD armature-local space and are now INCORRECT because the
+        armature's rotation was baked into the bone rest poses.
 
-        This method:
-        1. Reads the bone's world positions (sampled BEFORE transform_apply)
-        2. Computes armature.location = world_pos - bone.head_local_after_apply
-           (so the bone's visual position is preserved)
-        3. Zeros out the root bone's location keyframes
-        4. Creates armature object location keyframes
+        This method recomputes the root bone's location keyframes using the world
+        positions sampled BEFORE transform_apply, so the bone's visual world position
+        is preserved:
+            bone.location = world_pos_sampled - bone.head_local_after_apply
 
-        The armature's location animation is in Blender world space. The FBX exporter
-        will apply the correct axis conversion (axis_forward='-Z', axis_up='Y') to
-        convert it to FBX/UE5 space, producing correct root motion direction.
+        The root motion stays ON THE BONE (not transferred to armature object).
+        With armature_nodetype='NULL', UE5 treats the armature as a helper node
+        and uses the root bone (e.g. mixamorig:Hips) as the skeleton root.
+        This ensures Force Root Lock works correctly in UE5.
         """
         if not root_bone_world_positions:
-            print('RSL Export: No root bone world positions - skipping transfer')
+            print('RSL Export: No root bone world positions - skipping correction')
             return
 
         if not armature.animation_data or not armature.animation_data.action:
-            print('RSL Export: No animation data - skipping transfer')
+            print('RSL Export: No animation data - skipping correction')
             return
 
         action = armature.animation_data.action
@@ -516,7 +517,7 @@ class ExportFBXForUE5(bpy.types.Operator):
                 break
 
         if not root_bone_name:
-            print('RSL Export: No parentless root bone found - skipping transfer')
+            print('RSL Export: No parentless root bone found - skipping correction')
             return
 
         root_bone = armature.pose.bones[root_bone_name]
@@ -527,56 +528,45 @@ class ExportFBXForUE5(bpy.types.Operator):
 
         print(f'RSL Export: Root bone "{root_bone_name}" rest head after apply: {bone_rest_head}')
 
-        # Compute armature location at each frame:
-        # armature.location = world_pos - bone_rest_head
+        # Compute corrected bone location at each frame:
+        # bone.location = world_pos - bone_rest_head
         # This preserves the visual position because:
-        #   new_world_pos = armature.location + bone_rest_head + bone.location(=0)
-        #                = (world_pos - bone_rest_head) + bone_rest_head
+        #   new_world_pos = armature.matrix_world @ (bone_rest_head + bone.location)
+        #                = identity @ (bone_rest_head + (world_pos - bone_rest_head))
         #                = world_pos  ✓
-        armature_locations = {}
+        bone_locations = {}
         for frame, world_pos in root_bone_world_positions.items():
-            armature_locations[frame] = world_pos - bone_rest_head
+            bone_locations[frame] = world_pos - bone_rest_head
 
         # Debug: show the displacement
-        frames = sorted(armature_locations.keys())
+        frames = sorted(bone_locations.keys())
         if len(frames) > 1:
-            first_loc = armature_locations[frames[0]]
-            last_loc = armature_locations[frames[-1]]
+            first_loc = bone_locations[frames[0]]
+            last_loc = bone_locations[frames[-1]]
             delta = last_loc - first_loc
-            print(f'RSL Export: Armature location delta ({frames[0]}→{frames[-1]}): {delta}')
+            print(f'RSL Export: Root bone location delta ({frames[0]}→{frames[-1]}): {delta}')
             print(f'RSL Export: Delta length: {delta.length:.4f}')
 
-        # Zero out the root bone's location keyframes
+        # Remove existing bone location fcurves and recreate with correct values
         root_loc_fcurves = []
         for fcurve in action.fcurves:
             if fcurve.data_path == f'pose.bones["{root_bone_name}"].location':
                 root_loc_fcurves.append(fcurve)
 
         for fcurve in root_loc_fcurves:
-            for kp in fcurve.keyframe_points:
-                kp.co.y = 0.0
-            fcurve.update()
-
-        # Also set the bone's current location to zero
-        root_bone.location = (0, 0, 0)
-
-        # Remove any existing armature location fcurves
-        existing_loc_fcurves = []
-        for fcurve in action.fcurves:
-            if fcurve.data_path == 'location':
-                existing_loc_fcurves.append(fcurve)
-        for fcurve in existing_loc_fcurves:
             action.fcurves.remove(fcurve)
 
-        # Create new armature location fcurves
+        # Create new bone location fcurves with corrected values
         loc_fcurves = {}
         for axis in range(3):
-            fc = action.fcurves.new(data_path='location', index=axis)
+            fc = action.fcurves.new(
+                data_path=f'pose.bones["{root_bone_name}"].location',
+                index=axis)
             loc_fcurves[axis] = fc
 
-        # Populate armature location keyframes
-        for frame in sorted(armature_locations.keys()):
-            loc = armature_locations[frame]
+        # Populate bone location keyframes
+        for frame in sorted(bone_locations.keys()):
+            loc = bone_locations[frame]
             for axis in range(3):
                 fc = loc_fcurves[axis]
                 fc.keyframe_points.insert(frame, loc[axis])
@@ -585,17 +575,21 @@ class ExportFBXForUE5(bpy.types.Operator):
         for axis, fc in loc_fcurves.items():
             fc.update()
 
+        # Set the bone's current location to the first frame value
+        if frames:
+            root_bone.location = bone_locations[frames[0]]
+
         # Verify
         max_displacement = 0.0
         if len(frames) > 1:
-            first_loc = armature_locations[frames[0]]
-            last_loc = armature_locations[frames[-1]]
+            first_loc = bone_locations[frames[0]]
+            last_loc = bone_locations[frames[-1]]
             max_displacement = (last_loc - first_loc).length
 
-        print(f'RSL Export: Root motion transferred to armature object '
-              f'({len(armature_locations)} keyframes, displacement={max_displacement:.4f})')
-        print(f'RSL Export: Armature location at frame {frames[0]}: {armature_locations[frames[0]]}')
-        print(f'RSL Export: Armature location at frame {frames[-1]}: {armature_locations[frames[-1]]}')
+        print(f'RSL Export: Root bone location corrected '
+              f'({len(bone_locations)} keyframes, displacement={max_displacement:.4f})')
+        print(f'RSL Export: Bone location at frame {frames[0]}: {bone_locations[frames[0]]}')
+        print(f'RSL Export: Bone location at frame {frames[-1]}: {bone_locations[frames[-1]]}')
 
     @staticmethod
     def _cleanup(armature_copy, mesh_copies):
