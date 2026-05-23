@@ -2,6 +2,7 @@ import bpy
 import copy
 import math
 import mathutils
+import os
 
 from . import detector
 from ..core import utils
@@ -134,21 +135,22 @@ class ClearBoneList(bpy.types.Operator):
 class PrepareForUE5(bpy.types.Operator):
     """Prepare the retargeted armature for Unreal Engine FBX export.
 
-    Fixes common issues:
-    - Applies object-level rotation (90° X offset from BVH import)
-    - Sets the armature scale to 1.0 (prevents oversized import in UE5)
-    - Applies object location (moves root to origin)
-    - Bakes armature object transforms into bones before applying,
-      so bone animation data is preserved correctly
-    - Resets object transforms after baking
+    Bakes the armature's object-level transforms into bone keyframes,
+    then applies all transforms so the armature is at identity.
+    This fixes scale, rotation, and location issues when exporting to UE5.
 
-    Usage: Select the retargeted armature, then click this button before exporting as FBX.
+    After running this, use File > Export > FBX with these settings:
+    - Forward: -Z Forward
+    - Up: Y Up
+    - Scale: 1.0
+    - Apply Transform: enabled
+    - Armature > Primary Bone Axis: Y Axis (or X Axis for some rigs)
     """
     bl_idname = "rsl.prepare_for_ue5"
     bl_label = "Prepare for UE5 Export"
     bl_description = ('Prepares the retargeted armature for Unreal Engine FBX export. '
-                      'Applies object transforms into bones, normalizes scale and rotation '
-                      'to prevent flipped orientation and oversized import in UE5.')
+                      'Bakes object transforms into bone keyframes and applies them, '
+                      'fixing flipped orientation and oversized import in UE5.')
     bl_options = {'REGISTER', 'UNDO', 'INTERNAL'}
 
     @classmethod
@@ -163,63 +165,19 @@ class PrepareForUE5(bpy.types.Operator):
             self.report({'ERROR'}, 'Select an armature object first!')
             return {'CANCELLED'}
 
-        changes_made = []
+        self._prepare_armature(armature)
+        self.report({'INFO'}, 'UE5 prep done. Export as FBX: Forward=-Z, Up=Y, Scale=1.0, Apply Transform=ON')
+        return {'FINISHED'}
 
-        # Check what needs to be applied
-        has_non_identity_transform = False
-
-        # Check rotation
-        if armature.rotation_mode == 'QUATERNION':
-            rot = armature.rotation_quaternion
-            has_rotation = abs(rot.w - 1.0) > 0.001 or abs(rot.x) > 0.001 or abs(rot.y) > 0.001 or abs(rot.z) > 0.001
-        elif armature.rotation_mode == 'AXIS_ANGLE':
-            rot = armature.rotation_axis_angle
-            has_rotation = abs(rot[0]) > 0.001
-        else:
-            rot = armature.rotation_euler
-            has_rotation = abs(rot.x) > 0.001 or abs(rot.y) > 0.001 or abs(rot.z) > 0.001
-
-        # Check scale
-        has_non_uniform_scale = (
-            abs(armature.scale.x - 1.0) > 0.001 or
-            abs(armature.scale.y - 1.0) > 0.001 or
-            abs(armature.scale.z - 1.0) > 0.001
-        )
-
-        # Check location
-        has_location = (
-            abs(armature.location.x) > 0.001 or
-            abs(armature.location.y) > 0.001 or
-            abs(armature.location.z) > 0.001
-        )
-
-        if has_rotation or has_non_uniform_scale or has_location:
-            has_non_identity_transform = True
-
-        if not has_non_identity_transform:
-            self.report({'INFO'}, 'Armature transforms already at identity. '
-                                  'Export as FBX with Forward=-Z Forward, Up=Y Up, Scale=1.0')
-            return {'FINISHED'}
-
-        # Before applying transforms, we need to bake the armature's object-level
-        # animation into the bones so that data isn't lost.
-        # The key insight: when you Apply Transform on an armature object,
-        # it modifies the rest pose but doesn't update keyframed bone locations.
-        # For the ROOT bone, its world-space position comes from:
-        #   armature_object_location + root_bone_location
-        # After apply, root_bone_location must absorb the armature_object_location.
-        # But nla.bake with visual_keying handles this correctly.
-
-        # Save current action
-        original_action = None
+    @staticmethod
+    def _prepare_armature(armature):
+        """Core logic: bake visual pose, then apply all object transforms."""
+        # Bake animation with visual_keying to absorb object transforms into bones
         if armature.animation_data and armature.animation_data.action:
-            original_action = armature.animation_data.action
-
-        if original_action:
-            # Get frame range
+            action = armature.animation_data.action
             frame_start = None
             frame_end = None
-            for fcurve in original_action.fcurves:
+            for fcurve in action.fcurves:
                 for kp in fcurve.keyframe_points:
                     f = kp.co.x
                     if frame_start is None or f < frame_start:
@@ -228,50 +186,186 @@ class PrepareForUE5(bpy.types.Operator):
                         frame_end = f
 
             if frame_start is not None and frame_end is not None:
-                frame_start = int(frame_start)
-                frame_end = int(frame_end)
-
-                # Select all bones
                 utils.set_active(armature)
                 bpy.ops.object.mode_set(mode='POSE')
                 bpy.ops.pose.select_all(action='SELECT')
 
-                # Bake with visual_keying to capture the true world-space bone positions
-                # This will correctly absorb the armature object's transforms into bone keyframes
                 bpy.ops.nla.bake(
-                    frame_start=frame_start,
-                    frame_end=frame_end,
+                    frame_start=int(frame_start),
+                    frame_end=int(frame_end),
                     visual_keying=True,
                     only_selected=True,
                     use_current_action=True,
                     bake_types={'POSE'}
                 )
-
                 bpy.ops.object.mode_set(mode='OBJECT')
-                changes_made.append('Animation baked with visual keying')
 
-        # Now apply all object transforms
+        # Apply all object transforms
         utils.set_active(armature)
         bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
-        changes_made.append('Transforms applied (location, rotation, scale)')
+        print(f'RSL UE5 Prep: Applied all transforms. '
+              f'location={armature.location}, scale={armature.scale}')
 
-        # Verify the armature is at identity
-        print(f'RSL UE5 Prep: After apply - location={armature.location}, '
-              f'rotation_euler={armature.rotation_euler}, scale={armature.scale}')
 
-        if changes_made:
-            self.report({'INFO'}, f'UE5 prep done: {", ".join(changes_made)}. '
-                                  f'Now export as FBX:\n'
-                                  f'  Forward: -Z Forward\n'
-                                  f'  Up: Y Up\n'
-                                  f'  Scale: 1.0\n'
-                                  f'  Apply Transform: Yes (if available)')
-        else:
-            self.report({'INFO'}, 'No changes needed. '
-                                  'Export as FBX with Forward=-Z, Up=Y, Scale=1.0')
+class ExportFBXForUE5(bpy.types.Operator):
+    """Export the selected armature as FBX with correct settings for Unreal Engine 5.
 
+    This operator automates the entire export workflow:
+    1. Duplicates the armature (so original is not modified)
+    2. Bakes the animation with visual keying (absorbs object transforms into bones)
+    3. Applies object transforms (rotation, scale, location) to the duplicate
+    4. Exports as FBX with UE5-compatible settings
+    5. Deletes the duplicate (original armature stays unchanged)
+
+    The FBX file will import into UE5 at the correct scale and orientation.
+    """
+    bl_idname = "rsl.export_fbx_ue5"
+    bl_label = "Export FBX for UE5"
+    bl_description = ('Exports the selected armature as FBX with correct settings for Unreal Engine 5. '
+                      'Automatically bakes transforms, applies rotation/scale, and exports with '
+                      'Forward=-Z, Up=Y settings so the animation imports correctly. '
+                      'Original armature is not modified.')
+    bl_options = {'REGISTER', 'UNDO'}
+
+    # File path property for the file browser
+    filepath: bpy.props.StringProperty(subtype='FILE_PATH')
+    filename_ext = ".fbx"
+    filter_glob: bpy.props.StringProperty(default="*.fbx", options={'HIDDEN'})
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return obj and obj.type == 'ARMATURE'
+
+    def invoke(self, context, event):
+        if not self.filepath:
+            armature = context.active_object
+            blend_name = os.path.splitext(os.path.basename(bpy.data.filepath))[0] if bpy.data.filepath else 'untitled'
+            arm_name = armature.name if armature else 'armature'
+            self.filepath = f"{blend_name}_{arm_name}.fbx"
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        armature = context.active_object
+
+        if not armature or armature.type != 'ARMATURE':
+            self.report({'ERROR'}, 'Select an armature object first!')
+            return {'CANCELLED'}
+
+        filepath = self.filepath
+        if not filepath.lower().endswith('.fbx'):
+            filepath += '.fbx'
+
+        # --- Step 1: Duplicate the armature ---
+        # We work on a copy so the original is never modified
+        bpy.ops.object.select_all(action='DESELECT')
+        armature.select_set(True)
+        bpy.ops.object.duplicate_move(OBJECT_OT_duplicate={"linked": False, "mode": 'TRANSLATION'},
+                                      TRANSFORM_OT_translate={"value": (0, 0, 0)})
+        armature_copy = context.active_object
+        armature_copy.name = armature.name + "_UE5_export"
+
+        # Also duplicate child meshes
+        mesh_copies = []
+        for child in armature.children:
+            if child.type == 'MESH':
+                bpy.ops.object.select_all(action='DESELECT')
+                child.select_set(True)
+                armature_copy.select_set(True)
+                bpy.ops.object.duplicate_move(OBJECT_OT_duplicate={"linked": False, "mode": 'TRANSLATION'},
+                                              TRANSFORM_OT_translate={"value": (0, 0, 0)})
+                # The newly duplicated objects become active
+                for obj in context.selected_objects:
+                    if obj.type == 'MESH' and obj not in mesh_copies and obj != child:
+                        mesh_copies.append(obj)
+
+        # --- Step 2: Prepare the copy (bake + apply transforms) ---
+        PrepareForUE5._prepare_armature(armature_copy)
+
+        # --- Step 3: Remove armature-level animation fcurves from copy ---
+        if armature_copy.animation_data and armature_copy.animation_data.action:
+            fcurves_to_remove = []
+            for fcurve in armature_copy.animation_data.action.fcurves:
+                if fcurve.data_path in ('location', 'rotation_euler', 'rotation_quaternion',
+                                        'rotation_axis_angle', 'scale'):
+                    fcurves_to_remove.append(fcurve)
+            for fcurve in fcurves_to_remove:
+                armature_copy.animation_data.action.fcurves.remove(fcurve)
+
+        # Remove NLA tracks on copy
+        if armature_copy.animation_data:
+            for track in armature_copy.animation_data.nla_tracks:
+                armature_copy.animation_data.nla_tracks.remove(track)
+
+        # --- Step 4: Select copy + mesh copies for export ---
+        bpy.ops.object.select_all(action='DESELECT')
+        armature_copy.select_set(True)
+        for mesh in mesh_copies:
+            mesh.select_set(True)
+
+        # --- Step 5: Export FBX ---
+        export_kwargs = {
+            'filepath': filepath,
+            'use_selection': True,
+            'global_scale': 1.0,
+            'apply_unit_scale': True,
+            'axis_forward': '-Z',
+            'axis_up': 'Y',
+            'use_space_transform': True,
+            'bake_anim_use_nla_strips': False,
+            'bake_anim_use_all_actions': True,
+            'bake_anim_force_startend_keying': True,
+            'bake_anim_step': 1.0,
+            'bake_anim_simplify_factor': 0.0,
+            'object_types': {'ARMATURE', 'MESH'},
+            'use_mesh_modifiers': True,
+            'mesh_smooth_type': 'FACE',
+            'use_mesh_edges': False,
+            'use_tspace': False,
+            'primary_bone_axis': 'Y',
+            'secondary_bone_axis': 'X',
+            'armature_nodetype': 'ROOT',
+            'bake_anim': True,
+            'add_leaf_bones': False,
+            'use_custom_props': False,
+        }
+
+        try:
+            # Try with apply_scale_options (Blender 2.91+)
+            try:
+                export_kwargs_scaled = dict(export_kwargs)
+                export_kwargs_scaled['apply_scale_options'] = 'FBX_SCALE_ALL'
+                bpy.ops.export_scene.fbx(**export_kwargs_scaled)
+            except TypeError:
+                bpy.ops.export_scene.fbx(**export_kwargs)
+
+            print(f'RSL Export FBX for UE5: Exported to "{filepath}"')
+        except Exception as e:
+            self.report({'ERROR'}, f'FBX export failed: {e}')
+            # Clean up the copy even on failure
+            self._cleanup_copy(armature_copy, mesh_copies)
+            return {'CANCELLED'}
+
+        # --- Step 6: Delete the copy ---
+        self._cleanup_copy(armature_copy, mesh_copies)
+
+        # Restore original selection
+        bpy.ops.object.select_all(action='DESELECT')
+        utils.set_active(armature)
+        armature.select_set(True)
+
+        self.report({'INFO'}, f'FBX exported for UE5: {filepath}')
         return {'FINISHED'}
 
+    @staticmethod
+    def _cleanup_copy(armature_copy, mesh_copies):
+        """Delete the temporary duplicate armature and meshes."""
+        bpy.ops.object.select_all(action='DESELECT')
+        armature_copy.select_set(True)
+        for mesh in mesh_copies:
+            mesh.select_set(True)
+        bpy.ops.object.delete()
 
 class ApplyTPoseReference(bpy.types.Operator):
     """Apply T-pose rotations from a reference armature to the source animation's first frame."""

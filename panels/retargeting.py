@@ -134,22 +134,22 @@ class RetargetingPanel(ToolPanel, bpy.types.Panel):
         row.scale_y = 1.4
         row.operator(retargeting.RetargetAnimation.bl_idname, icon_value=Icons.CALIBRATE.get_icon())
 
-        # UE5 Export Preparation section
+        # UE5 Export section
         layout.separator()
         row = layout.row(align=True)
         row.label(text='UE5 Export:', icon='EXPORT')
 
         row = layout.row(align=True)
-        row.scale_y = 1.1
-        row.operator(retargeting.PrepareForUE5.bl_idname, icon='EXPORT')
+        row.scale_y = 1.2
+        row.operator(retargeting.ExportFBXForUE5.bl_idname, icon='EXPORT')
+
+        row = layout.row(align=True)
+        row.scale_y = 1.0
+        row.operator(retargeting.PrepareForUE5.bl_idname, text='Prep Only (Manual FBX)', icon='SETTINGS')
 
         row = layout.row(align=True)
         row.scale_y = 0.7
-        row.label(text='  Bake transforms & apply before FBX export', icon='INFO')
-
-        row = layout.row(align=True)
-        row.scale_y = 0.7
-        row.label(text='  FBX settings: Forward=-Z, Up=Y, Scale=1.0', icon='INFO')
+        row.label(text='  Use "Export FBX for UE5" for best results', icon='INFO')
 
         self.draw_import_export(layout)
 
