@@ -12,11 +12,11 @@ import addon_utils
 from threading import Thread
 from bpy.app.handlers import persistent
 
-beta_branch = "beta"
-
-GITHUB_URL = "https://api.github.com/repos/Mmitekk/rokoko-studio-live-blender/releases"
-GITHUB_URL_BETA = f"https://github.com/Mmitekk/rokoko-studio-live-blender/archive/{beta_branch}.zip"
-GITHUB_COMPATIBILITY_URL = "https://raw.githubusercontent.com/Mmitekk/rokoko-studio-live-blender/master/version_compatibility.json"
+GITHUB_REPO = "Mmitekk/rokoko-studio-live-blender"
+GITHUB_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases"
+GITHUB_URL_MASTER = f"https://github.com/{GITHUB_REPO}/archive/master.zip"
+GITHUB_URL_COMMITS = f"https://api.github.com/repos/{GITHUB_REPO}/commits/master"
+GITHUB_COMPATIBILITY_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/master/version_compatibility.json"
 
 downloads_dir_name = "updater_downloads"
 
@@ -342,13 +342,45 @@ def get_github_releases():
 
     if not data:
         if type(data) == list:
+            # No releases found — offer master branch as a fallback version
+            _add_master_branch_fallback()
             return True
         return False
 
     for version_data in data:
         Version(version_data)
 
+    # If no releases were parsed (all yanked etc.), offer master branch
+    if not version_list:
+        _add_master_branch_fallback()
+
     return True
+
+
+def _add_master_branch_fallback():
+    """Add a virtual 'Latest from master' version when no GitHub releases exist."""
+    global version_list
+    print('RSL Updater: No GitHub releases found, offering master branch as fallback...')
+
+    commit_sha = 'unknown'
+    commit_date = 'Unknown'
+    try:
+        ssl._create_default_https_context = ssl._create_unverified_context
+        with urllib.request.urlopen(GITHUB_URL_COMMITS) as url:
+            commit_data = json.loads(url.read().decode())
+        commit_sha = commit_data.get('sha', 'unknown')[:7]
+        commit_date = commit_data.get('commit', {}).get('committer', {}).get('date', 'Unknown')
+    except Exception as e:
+        print(f'RSL Updater: Could not fetch commit info: {e}')
+
+    Version({
+        'tag_name': '999.0.0',
+        'name': f'Latest master ({commit_sha})',
+        'zipball_url': GITHUB_URL_MASTER,
+        'body': f'Latest version from the master branch.\nCommit: {commit_sha}\nDate: {commit_date}',
+        'published_at': commit_date if commit_date != 'Unknown' else '2025-01-01T00:00:00Z',
+        'prerelease': True  # Mark as pre-release so it shows as (beta)
+    })
 
 
 def check_for_update_available() -> bool:
@@ -433,8 +465,8 @@ def update_now(version=None, latest=False, beta=False):
         finish_update()
         return
     if beta:
-        print('UPDATE TO BETA')
-        update_link = GITHUB_URL_BETA
+        print('UPDATE TO BETA / MASTER')
+        update_link = GITHUB_URL_MASTER
     elif latest or not version:
         print('UPDATE TO ' + latest_version_str)
         update_link = get_latest_version().download_link

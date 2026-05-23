@@ -59,9 +59,13 @@ class UpdateToSelectedButton(bpy.types.Operator):
 
 class UpdateToBetaButton(bpy.types.Operator):
     bl_idname = 'rsl_updater.update_beta'
-    bl_label = 'Update to Beta version'
-    bl_description = 'Updates Rokoko Studio Live to the Beta version'
+    bl_label = 'Install Latest from GitHub'
+    bl_description = 'Download and install the latest version from the master branch on GitHub'
     bl_options = {'INTERNAL'}
+
+    @classmethod
+    def poll(cls, context):
+        return not updater.is_checking_for_update
 
     def execute(self, context):
         updater.confirm_update_to = 'beta'
@@ -434,7 +438,7 @@ def draw_updater_panel(context, layout, user_preferences=False):
 
     row = col.row(align=True)
     row.scale_y = scale_small
-    row.operator(UpdateToBetaButton.bl_idname, text='Install Beta Version')
+    row.operator(UpdateToBetaButton.bl_idname, text='Install Latest from GitHub')
 
     # If version is default, don't show the current version
     if "error" in updater.current_version_str:
