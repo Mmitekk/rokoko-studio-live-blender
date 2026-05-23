@@ -149,7 +149,7 @@ class RetargetingPanel(ToolPanel, bpy.types.Panel):
 
         row = layout.row(align=True)
         row.scale_y = 0.7
-        row.label(text='  Use "Export FBX for UE5" for best results', icon='INFO')
+        row.label(text='  Use "Export FBX" for best results', icon='INFO')
 
         self.draw_import_export(layout)
 
