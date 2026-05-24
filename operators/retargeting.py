@@ -141,7 +141,7 @@ class PrepareForUE5(bpy.types.Operator):
     the transform.
 
     After running this, use File > Export > FBX with these settings:
-      Forward: -Z Forward | Up: Y Up | Scale: 1.0 | Apply Scalings: FBX All
+      Forward: -Y Forward | Up: Z Up | Scale: 1.0 | Apply Scalings: FBX All
     Or simply use the "Export FBX for UE5" button which does everything
     automatically.
     """
@@ -149,7 +149,7 @@ class PrepareForUE5(bpy.types.Operator):
     bl_label = "Prepare for UE5 Export"
     bl_description = ('Applies object transforms to bone data and removes '
                       'object-level animation. Fixes flipped/oversized import in UE5. '
-                      'After this, export FBX with Forward=-Z, Up=Y.')
+                      'After this, export FBX with Forward=-Y, Up=Z.')
     bl_options = {'REGISTER', 'UNDO', 'INTERNAL'}
 
     @classmethod
@@ -186,9 +186,9 @@ class PrepareForUE5(bpy.types.Operator):
 
         if changes:
             self.report({'INFO'}, f'UE5 prep: {", ".join(changes)}. '
-                                  'Now export FBX: Forward=-Z, Up=Y, Scale=1.0')
+                                  'Now export FBX: Forward=-Y, Up=Z, Scale=1.0')
         else:
-            self.report({'INFO'}, 'Armature already prepared. Export FBX: Forward=-Z, Up=Y, Scale=1.0')
+            self.report({'INFO'}, 'Armature already prepared. Export FBX: Forward=-Y, Up=Z, Scale=1.0')
 
         return {'FINISHED'}
 
@@ -225,6 +225,15 @@ class ExportFBXForUE5(bpy.types.Operator):
     armature node's rotation. The armature node ends up with IDENTITY transform
     in FBX, so Force Root Lock works correctly without flipping.
 
+    WHY axis_forward='-Y' / axis_up='Z' (CRITICAL for root motion direction):
+    In Blender, characters face the -Y direction and Z is up. The FBX export
+    must map these correctly to UE5 where +X is forward and +Z is up:
+      Blender -Y (character forward) → UE5 +X (forward) via axis_forward='-Y'
+      Blender +Z (up)               → UE5 +Z (up)    via axis_up='Z'
+    Previous versions used axis_forward='-Z' / axis_up='Y', which incorrectly
+    mapped walking motion (Blender Y) to vertical (UE5 Z), causing the
+    character to walk underground without Force Root Lock.
+
     WHY armature_nodetype='NULL' (not 'ROOT'):
     With 'NULL', the armature is a helper node, and the topmost actual bone
     (e.g. mixamorig:Hips) becomes the root bone in UE5. Since the walking
@@ -237,7 +246,7 @@ class ExportFBXForUE5(bpy.types.Operator):
     bl_label = "Export FBX"
     bl_description = ('One-click export to UE5-ready FBX. Applies transforms, '
                       'bakes axis conversion into bone data (bake_space_transform), '
-                      'and exports with Forward=-Z/Up=Y for correct root motion '
+                      'and exports with Forward=-Y/Up=Z for correct root motion '
                       'and Force Root Lock support in UE5.')
     bl_options = {'REGISTER', 'UNDO'}
 
@@ -346,7 +355,10 @@ class ExportFBXForUE5(bpy.types.Operator):
 
         # --- Step 6: Export FBX with UE5 settings ---
         # CRITICAL SETTINGS:
-        #   axis_forward='-Z' / axis_up='Y' — standard Blender→UE5 axis conversion
+        #   axis_forward='-Y' / axis_up='Z' — correct Blender→UE5 axis conversion
+        #     In Blender, characters face -Y and Z is up. These settings map:
+        #       Blender -Y → UE5 +X (forward), Blender +Z → UE5 +Z (up)
+        #     Previous versions used -Z/Y which incorrectly mapped walking to vertical.
         #   armature_nodetype='NULL' — armature is a helper node, root bone is
         #     the topmost actual bone (mixamorig:Hips) which has walking motion
         #   bake_space_transform=True — bake axis conversion into bone data instead
@@ -360,8 +372,8 @@ class ExportFBXForUE5(bpy.types.Operator):
                 use_selection=True,
                 global_scale=1.0,
                 apply_scale_options='FBX_SCALE_ALL',
-                axis_forward='-Z',
-                axis_up='Y',
+                axis_forward='-Y',
+                axis_up='Z',
                 use_mesh_modifiers=True,
                 mesh_smooth_type='OFF',
                 use_tspace=True,
@@ -389,8 +401,8 @@ class ExportFBXForUE5(bpy.types.Operator):
                     filepath=filepath,
                     use_selection=True,
                     global_scale=1.0,
-                    axis_forward='-Z',
-                    axis_up='Y',
+                    axis_forward='-Y',
+                    axis_up='Z',
                     use_mesh_modifiers=True,
                     mesh_smooth_type='OFF',
                     use_tspace=True,
@@ -512,6 +524,19 @@ class ExportFBXForUE5(bpy.types.Operator):
             max_displacement = delta.length
             print(f'RSL Export: Root bone "{root_bone_name}" location delta: {delta}')
             print(f'RSL Export: Delta length: {delta.length:.4f}')
+            # Diagnostic: warn if walking motion is primarily vertical (axis issue)
+            abs_delta = Vector((abs(delta.x), abs(delta.y), abs(delta.z)))
+            dominant_axis = ['X', 'Y', 'Z'][abs_delta.index(max(abs_delta))]
+            if dominant_axis == 'Z' and abs_delta.z > 0.01:
+                # In Blender world space (after _correct_root_bone_location),
+                # walking should be along Y (forward), Z is up.
+                # If Z dominates, the motion may be mapped to vertical in UE5.
+                print(f'RSL Export: WARNING - Walking delta is primarily along {dominant_axis} '
+                      f'({delta}). After FBX export, this should map to UE5 forward (+X). '
+                      f'If the character walks underground in UE5, check axis settings.')
+            elif dominant_axis == 'Y' and abs_delta.y > 0.01:
+                print(f'RSL Export: Walking delta is along Y (Blender forward) - '
+                      f'correct direction for axis_forward=-Y export')
 
         # Remove old fcurves
         for fc in loc_fcurves:
