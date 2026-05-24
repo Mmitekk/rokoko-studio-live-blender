@@ -525,9 +525,9 @@ class ExportFBXForUE5(bpy.types.Operator):
             print(f'RSL Export: Root bone "{root_bone_name}" location delta: {delta}')
             print(f'RSL Export: Delta length: {delta.length:.4f}')
             # Diagnostic: warn if walking motion is primarily vertical (axis issue)
-            abs_delta = Vector((abs(delta.x), abs(delta.y), abs(delta.z)))
-            dominant_axis = ['X', 'Y', 'Z'][abs_delta.index(max(abs_delta))]
-            if dominant_axis == 'Z' and abs_delta.z > 0.01:
+            abs_vals = [abs(delta.x), abs(delta.y), abs(delta.z)]
+            dominant_axis = ['X', 'Y', 'Z'][abs_vals.index(max(abs_vals))]
+            if dominant_axis == 'Z' and abs_vals[2] > 0.01:
                 # In Blender world space (after _correct_root_bone_location),
                 # walking should be along Y (forward), Z is up.
                 # If Z dominates, the motion may be mapped to vertical in UE5.
