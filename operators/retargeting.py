@@ -534,7 +534,7 @@ class ExportFBXForUE5(bpy.types.Operator):
                 print(f'RSL Export: WARNING - Walking delta is primarily along {dominant_axis} '
                       f'({delta}). After FBX export, this should map to UE5 forward (+X). '
                       f'If the character walks underground in UE5, check axis settings.')
-            elif dominant_axis == 'Y' and abs_delta.y > 0.01:
+            elif dominant_axis == 'Y' and abs_vals[1] > 0.01:
                 print(f'RSL Export: Walking delta is along Y (Blender forward) - '
                       f'correct direction for axis_forward=-Y export')
 
