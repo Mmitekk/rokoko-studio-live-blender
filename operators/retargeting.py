@@ -202,39 +202,43 @@ class ExportFBXForUE5(bpy.types.Operator):
       2. Saves the armature's rotation+scale matrix BEFORE transform_apply
       3. Applies all object transforms on the copies (bakes rotation/scale into bones)
       4. Corrects root bone location keyframes using the saved rotation matrix
-      5. Transfers root motion from bone to armature OBJECT (for FBX axis conversion)
-      6. Removes rotation/scale object-level animation keyframes (keeps location)
-      7. Exports as FBX with UE5-compatible settings (Forward=-Y, Up=Z, ROOT nodetype)
-      8. Deletes the temporary copies
+      5. Removes ALL object-level animation keyframes (location, rotation, scale)
+      6. Exports as FBX with UE5-compatible settings
+      7. Deletes the temporary copies
 
     ROOT MOTION STRATEGY:
-    Root motion is transferred to the ARMATURE OBJECT, not kept on the bone.
-    The armature is exported as armature_nodetype='ROOT', so UE5 treats it as
-    the root bone and extracts root motion from its location animation.
+    Root motion stays on the BONE (mixamorig:Hips). The armature is exported
+    as armature_nodetype='NULL' (helper node, not a bone), so UE5 treats the
+    topmost actual bone (mixamorig:Hips) as the root bone and extracts root
+    motion from its location animation.
 
-    WHY Forward=-Y, Up=Z (instead of the common Forward=-Z, Up=Y):
-    After transform_apply, the BVH import rotation (-90 deg X) is baked into
-    the bones. The character's forward direction becomes -Y (Blender's native
-    forward). Using Forward=-Y, Up=Z makes the FBX global_matrix = identity,
-    which means:
-      - No axis conversion rotation on the armature node
-      - The armature root bone has identity rotation in UE5
-      - Force Root Lock works correctly (no skeleton flip)
-      - Walking in -Y maps directly to UE5 forward (+X)
+    WHY bake_space_transform=True (CRITICAL for Force Root Lock):
+    The Blender FBX exporter normally applies the axis conversion matrix as a
+    ROTATION on the armature object node in the FBX file. When UE5 enables
+    "Force Root Lock", it locks the root bone to its reference pose. But the
+    root bone's reference pose is computed relative to its parent (the armature
+    node), which has this hidden rotation. This causes the entire skeleton to
+    flip 90 degrees (upside down, parallel to the floor).
 
-    WHY TRANSFER TO ARMATURE OBJECT (not keep on bone):
-    The Blender FBX exporter applies axis conversion (global_matrix) to OBJECT
-    animation curves, but NOT to bone animation curves. Bones inherit the
-    coordinate space from the armature node. When the armature node has an
-    axis conversion rotation, bone location values get misinterpreted by UE5,
-    causing chaotic animation. By putting root motion on the armature object,
-    the FBX exporter handles the coordinate conversion correctly.
+    Setting bake_space_transform=True bakes the axis conversion directly into
+    the bone data (rest poses + animation curves) instead of storing it as the
+    armature node's rotation. The armature node ends up with IDENTITY transform
+    in FBX, so Force Root Lock works correctly without flipping.
+
+    WHY armature_nodetype='NULL' (not 'ROOT'):
+    With 'NULL', the armature is a helper node, and the topmost actual bone
+    (e.g. mixamorig:Hips) becomes the root bone in UE5. Since the walking
+    motion is on this bone (from retargeting), UE5 can extract root motion
+    directly from it. With 'ROOT', the armature object becomes the root bone,
+    but it has no location animation (we removed it), so UE5 can't extract
+    root motion from it.
     """
     bl_idname = "rsl.export_fbx_ue5"
     bl_label = "Export FBX"
     bl_description = ('One-click export to UE5-ready FBX. Applies transforms, '
-                      'transfers root motion to armature object, and exports '
-                      'with Forward=-Y/Up=Z for correct root motion in UE5.')
+                      'bakes axis conversion into bone data (bake_space_transform), '
+                      'and exports with Forward=-Z/Up=Y for correct root motion '
+                      'and Force Root Lock support in UE5.')
     bl_options = {'REGISTER', 'UNDO'}
 
     filepath: bpy.props.StringProperty(subtype='FILE_PATH')
@@ -299,26 +303,22 @@ class ExportFBXForUE5(bpy.types.Operator):
         # --- Step 4: Correct root bone location using the saved rotation+scale matrix ---
         self._correct_root_bone_location(armature_copy, saved_rot_scale)
 
-        # --- Step 5: Transfer root motion from bone to armature OBJECT ---
-        # The Blender FBX exporter applies axis conversion (global_matrix) to
-        # OBJECT animation, but NOT to bone animation. By putting root motion
-        # on the armature object, the FBX exporter handles coordinates correctly.
-        # With axis_forward='-Y', axis_up='Z', global_matrix = identity, so
-        # the armature object's location values pass through unchanged.
-        # UE5 reads the FBX axis definitions and converts -Y→X (forward), Z→Z (up).
-        self._transfer_root_motion_to_armature(armature_copy)
-
-        # --- Step 6: Remove rotation/scale object-level fcurves (keep location) ---
-        # Root motion is now on the armature object's LOCATION, so we must
-        # keep location fcurves. Only remove rotation and scale.
+        # --- Step 5: Remove ALL object-level animation fcurves ---
+        # Root motion stays on the bone (mixamorig:Hips), not on the armature
+        # object. With bake_space_transform=True, the FBX exporter will handle
+        # the axis conversion by baking it into bone data, so the armature
+        # object should have NO animation at all.
         if armature_copy.animation_data and armature_copy.animation_data.action:
             fcurves_to_remove = []
             for fcurve in armature_copy.animation_data.action.fcurves:
-                if fcurve.data_path in ('rotation_euler', 'rotation_quaternion',
+                if fcurve.data_path in ('location', 'rotation_euler', 'rotation_quaternion',
                                         'rotation_axis_angle', 'scale'):
                     fcurves_to_remove.append(fcurve)
             for fcurve in fcurves_to_remove:
                 armature_copy.animation_data.action.fcurves.remove(fcurve)
+            if fcurves_to_remove:
+                print(f'RSL Export: Removed {len(fcurves_to_remove)} object-level fcurves '
+                      f'(root motion stays on bone)')
 
         # Remove NLA tracks on copy (they can interfere with FBX bake)
         if armature_copy.animation_data:
@@ -344,21 +344,24 @@ class ExportFBXForUE5(bpy.types.Operator):
         for mesh in mesh_copies:
             mesh.select_set(True)
 
-        # --- Step 8: Export FBX with UE5 settings ---
-        # CRITICAL: axis_forward='-Y', axis_up='Z' (Blender native axes)
-        # This makes global_matrix = identity, which means:
-        #   - No axis conversion rotation on the armature node
-        #   - Armature root bone has identity rotation in UE5
-        #   - Force Root Lock works without flipping the skeleton
-        #   - Walking in -Y maps directly to UE5 forward (+X)
+        # --- Step 6: Export FBX with UE5 settings ---
+        # CRITICAL SETTINGS:
+        #   axis_forward='-Z' / axis_up='Y' — standard Blender→UE5 axis conversion
+        #   armature_nodetype='NULL' — armature is a helper node, root bone is
+        #     the topmost actual bone (mixamorig:Hips) which has walking motion
+        #   bake_space_transform=True — bake axis conversion into bone data instead
+        #     of applying it as rotation on the armature node. This is CRITICAL
+        #     for Force Root Lock: without it, the armature node has a 90° rotation
+        #     from axis conversion, and Force Root Lock locks the root bone relative
+        #     to this rotated parent, causing the skeleton to flip upside down.
         try:
             bpy.ops.export_scene.fbx(
                 filepath=filepath,
                 use_selection=True,
                 global_scale=1.0,
                 apply_scale_options='FBX_SCALE_ALL',
-                axis_forward='-Y',
-                axis_up='Z',
+                axis_forward='-Z',
+                axis_up='Y',
                 use_mesh_modifiers=True,
                 mesh_smooth_type='OFF',
                 use_tspace=True,
@@ -374,8 +377,8 @@ class ExportFBXForUE5(bpy.types.Operator):
                 use_mesh_vertices=False,
                 primary_bone_axis='Y',
                 secondary_bone_axis='X',
-                armature_nodetype='ROOT',
-                bake_space_transform=False,
+                armature_nodetype='NULL',
+                bake_space_transform=True,
                 object_types={'ARMATURE', 'MESH'},
             )
             print(f'RSL Export FBX for UE5: Exported to "{filepath}"')
@@ -386,8 +389,8 @@ class ExportFBXForUE5(bpy.types.Operator):
                     filepath=filepath,
                     use_selection=True,
                     global_scale=1.0,
-                    axis_forward='-Y',
-                    axis_up='Z',
+                    axis_forward='-Z',
+                    axis_up='Y',
                     use_mesh_modifiers=True,
                     mesh_smooth_type='OFF',
                     use_tspace=True,
@@ -397,7 +400,8 @@ class ExportFBXForUE5(bpy.types.Operator):
                     bake_anim_use_all_actions=False,
                     primary_bone_axis='Y',
                     secondary_bone_axis='X',
-                    armature_nodetype='ROOT',
+                    armature_nodetype='NULL',
+                    bake_space_transform=True,
                     object_types={'ARMATURE', 'MESH'},
                 )
                 print(f'RSL Export FBX (compat mode): Exported to "{filepath}"')
@@ -410,7 +414,7 @@ class ExportFBXForUE5(bpy.types.Operator):
             self._cleanup(armature_copy, mesh_copies)
             return {'CANCELLED'}
 
-        # --- Step 9: Clean up - delete the temporary copies ---
+        # --- Step 7: Clean up - delete the temporary copies ---
         self._cleanup(armature_copy, mesh_copies)
 
         # Restore original selection
