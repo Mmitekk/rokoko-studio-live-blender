@@ -197,18 +197,15 @@ class ExportFBXForUE5(bpy.types.Operator):
     """Export the selected armature as FBX with correct settings for Unreal Engine 5.
 
     This operator automates the entire export workflow without modifying the
-    original armature. The key insight is that we MANUALLY bake the axis
-    conversion into bone data instead of relying on bake_space_transform,
-    which may be silently ignored in some Blender versions (e.g. 4.5).
+    original armature.
 
     Pipeline:
       1. Duplicate the armature + child meshes
-      2. Apply object transforms (bakes armature rotation into bone rest poses)
-      3. Correct root bone location keyframes
-      4. Manually bake the Blender→FBX axis conversion into bone data
-         by applying it as a second transform_apply
+      2. Save the armature's rotation+scale matrix
+      3. Apply object transforms (bakes armature rotation into bone rest poses)
+      4. Correct root bone location keyframes (Blender doesn't adjust them)
       5. Remove object-level animation fcurves
-      6. Export with bake_space_transform=False (we already baked it)
+      6. Export FBX with bake_space_transform=True (handles axis conversion)
       7. Clean up temporary copies
 
     ROOT MOTION STRATEGY:
@@ -216,25 +213,25 @@ class ExportFBXForUE5(bpy.types.Operator):
     exported as armature_nodetype='NULL' so UE5 treats the topmost actual
     bone as the root bone and extracts root motion from its location.
 
-    WHY MANUAL AXIS BAKING (not bake_space_transform):
-    bake_space_transform=True is supposed to bake the FBX axis conversion
-    into bone data so the armature node has identity transform. However,
-    in Blender 4.5+ this parameter may be silently ignored — the export
-    succeeds but the conversion is applied as a rotation on the armature
-    node instead of being baked into bones. This causes:
-      - Without Force Root Lock: character walks in wrong direction (underground)
-      - With Force Root Lock: skeleton flips 90° (parallel to floor)
+    WHY transform_apply BEFORE export:
+    Imported armatures (e.g. from Mixamo) typically have a 90° X rotation
+    on the armature object to compensate for Blender Z-up vs FBX Y-up.
+    When bake_space_transform=True, it bakes (axis_conversion @ armature_transform)
+    into bone data. If the armature has 90° X rotation, this combined transform
+    becomes R(-90°,X) @ R(90°,X) = Identity, meaning NO conversion is applied
+    and bone data stays in Blender space — causing the character to walk
+    underground or sideways in UE5.
 
-    Our solution: manually apply the axis conversion as a second
-    transform_apply step, then export with bake_space_transform=False
-    and axis_forward='-Y'/axis_up='Z' which matches the already-converted
-    data orientation, producing an identity conversion in the exporter.
+    Our solution: first apply the armature's object transforms via transform_apply,
+    so the armature is at identity. Then bake_space_transform only needs to apply
+    the axis conversion (R(-90°,X)), correctly converting bone data from Blender
+    space (Z-up, -Y-forward) to FBX space (Y-up, Z-forward). UE5 then correctly
+    maps the walking motion from FBX forward (+Z) to UE5 forward (+X).
     """
     bl_idname = "rsl.export_fbx_ue5"
     bl_label = "Export FBX"
-    bl_description = ('One-click export to UE5-ready FBX. Manually bakes axis '
-                      'conversion into bone data for correct root motion and '
-                      'Force Root Lock support in UE5.')
+    bl_description = ('One-click export to UE5-ready FBX with correct root '
+                      'motion and axis conversion for Unreal Engine 5.')
     bl_options = {'REGISTER', 'UNDO'}
 
     filepath: bpy.props.StringProperty(subtype='FILE_PATH')
@@ -266,7 +263,7 @@ class ExportFBXForUE5(bpy.types.Operator):
         if not filepath.lower().endswith('.fbx'):
             filepath += '.fbx'
 
-        print(f'RSL Export v1.6.1: Starting UE5 FBX export for "{armature.name}"')
+        print(f'RSL Export v1.7.1: Starting UE5 FBX export for "{armature.name}"')
 
         # --- Step 1: Select armature + child meshes and duplicate together ---
         bpy.ops.object.select_all(action='DESELECT')
@@ -283,12 +280,17 @@ class ExportFBXForUE5(bpy.types.Operator):
         mesh_copies = [obj for obj in context.selected_objects if obj.type == 'MESH']
 
         # --- Step 2: Save the armature's rotation+scale matrix BEFORE transform_apply ---
+        # We need this to correct root bone location keyframes after apply,
+        # because Blender's transform_apply does NOT adjust bone location keyframes.
         saved_rot_scale = armature_copy.matrix_world.to_3x3().copy()
         print(f'RSL Export: Saved armature rotation+scale matrix:\n{saved_rot_scale}')
 
-        # --- Step 3: Apply ALL transforms on the copies (1st transform_apply) ---
+        # --- Step 3: Apply ALL transforms on the copies ---
         # This bakes the armature's object-level rotation (e.g. 90° X for Mixamo)
         # into the bone rest poses. After this, the armature is at identity.
+        # This is CRITICAL: without this step, bake_space_transform would compute
+        # axis_conversion @ armature_rotation = R(-90°,X) @ R(90°,X) = Identity,
+        # resulting in NO axis conversion and bone data staying in Blender space.
         bpy.ops.object.select_all(action='DESELECT')
         utils.set_active(armature_copy)
         bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
@@ -298,39 +300,18 @@ class ExportFBXForUE5(bpy.types.Operator):
             utils.set_active(mesh)
             bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
 
-        # --- Step 4: Correct root bone location after 1st transform_apply ---
+        # --- Step 4: Correct root bone location after transform_apply ---
+        # Blender's transform_apply adjusts bone rest poses but NOT bone location
+        # keyframes. For parentless bones, location is in armature space. After
+        # apply, the new armature space is world space (identity). The old location
+        # values must be transformed by the saved rotation+scale matrix:
+        #   new_bone_location = saved_rot_scale @ old_bone_location
         self._correct_root_bone_location(armature_copy, saved_rot_scale)
 
-        # --- Step 5: Manually bake the Blender→FBX axis conversion ---
-        # The FBX format uses Y-up, Z-forward. Blender uses Z-up, -Y-forward.
-        # The conversion is a -90° rotation around X:
-        #   Blender +Z (up)     → FBX +Y (up)
-        #   Blender -Y (fwd)    → FBX +Z (fwd)
-        #   Blender +X (right)  → FBX +X (right)
-        #
-        # We apply this rotation to the armature and do a 2nd transform_apply,
-        # which bakes it into the bone rest poses. Then we correct the bone
-        # locations again. After this, the bone data is in FBX coordinate space
-        # and the armature is back at identity.
-        axis_conv_matrix = mathutils.Matrix.Rotation(math.radians(-90.0), 3, 'X')
-        print(f'RSL Export: Axis conversion matrix (Blender→FBX):\n{axis_conv_matrix}')
-
-        # Set the armature's rotation to the axis conversion
-        axis_conv_euler = axis_conv_matrix.to_euler()
-        armature_copy.rotation_mode = 'XYZ'
-        armature_copy.rotation_euler = axis_conv_euler
-
-        # Apply the rotation (2nd transform_apply)
-        bpy.ops.object.select_all(action='DESELECT')
-        utils.set_active(armature_copy)
-        bpy.ops.object.transform_apply(location=False, rotation=True, scale=False)
-
-        # Correct root bone location after the 2nd transform_apply
-        self._correct_root_bone_location(armature_copy, axis_conv_matrix)
-
-        print(f'RSL Export: Axis conversion manually baked into bone data')
-
-        # --- Step 6: Remove ALL object-level animation fcurves ---
+        # --- Step 5: Remove ALL object-level animation fcurves ---
+        # After transform_apply, the armature is at identity, so any remaining
+        # object-level keyframes would be at or near zero. Remove them to prevent
+        # the FBX exporter from including unnecessary armature-level animation.
         if armature_copy.animation_data and armature_copy.animation_data.action:
             fcurves_to_remove = []
             for fcurve in armature_copy.animation_data.action.fcurves:
@@ -360,24 +341,25 @@ class ExportFBXForUE5(bpy.types.Operator):
             except ReferenceError:
                 pass
 
-        # --- Step 7: Select all copies for export ---
+        # --- Step 6: Select all copies for export ---
         bpy.ops.object.select_all(action='DESELECT')
         armature_copy.select_set(True)
         for mesh in mesh_copies:
             mesh.select_set(True)
 
-        # --- Step 8: Export FBX ---
-        # After step 5, bone data is in FBX coordinate space (Y-up, Z-forward).
-        # In Blender's viewport, the character now faces +Z and +Y is up.
-        # We use axis_forward='Z'/axis_up='Y' to tell the exporter that the
-        # data's forward is +Z and up is +Y. With bake_space_transform=False,
-        # the exporter applies its conversion but since the armature is at
-        # identity and the data orientation matches these axis settings, the
-        # armature node in FBX should be at or near identity.
+        # --- Step 7: Export FBX ---
+        # After steps 3-4, the armature is at identity and bone data (including
+        # corrected root bone locations) is in Blender world space (Z-up, -Y-forward).
         #
-        # We also try with bake_space_transform=True as first attempt, since
-        # it should produce an identity bake (no-op) when the data already
-        # matches the axis settings.
+        # We export with standard Blender axis settings (axis_forward='-Y', axis_up='Z')
+        # and bake_space_transform=True. Since the armature is at identity, the
+        # combined space transform is just the axis conversion (R(-90°, X)), which
+        # correctly converts bone data from Blender space to FBX space:
+        #   Blender -Y (forward) → FBX +Z (forward) → UE5 +X (forward)
+        #   Blender +Z (up)      → FBX +Y (up)      → UE5 +Z (up)
+        #
+        # With armature_nodetype='NULL', UE5 treats the topmost bone as the root
+        # bone and extracts root motion from its location keyframes.
         export_params = dict(
             filepath=filepath,
             use_selection=True,
@@ -441,7 +423,7 @@ class ExportFBXForUE5(bpy.types.Operator):
             self._cleanup(armature_copy, mesh_copies)
             return {'CANCELLED'}
 
-        # --- Step 9: Clean up ---
+        # --- Step 8: Clean up ---
         self._cleanup(armature_copy, mesh_copies)
 
         # Restore original selection
