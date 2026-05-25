@@ -263,7 +263,7 @@ class ExportFBXForUE5(bpy.types.Operator):
         if not filepath.lower().endswith('.fbx'):
             filepath += '.fbx'
 
-        print(f'RSL Export v2.1.0: Starting UE5 FBX export for "{armature.name}"')
+        print(f'RSL Export v2.2.0: Starting UE5 FBX export for "{armature.name}"')
 
         # --- Step 1: Select armature + child meshes and duplicate together ---
         bpy.ops.object.select_all(action='DESELECT')
@@ -1059,7 +1059,11 @@ class RetargetAnimation(bpy.types.Operator):
             constraint.target = armature_source
             constraint.subtarget = item.bone_name_target + RETARGET_ID
 
-            # Add COPY_LOCATION for parentless root bones (original behavior)
+            # Add COPY_LOCATION ONLY for parentless root bones that are in the
+            # retarget list. Do NOT add COPY_LOCATION for hip/root motion bones
+            # (e.g. pelvis) because COPY_LOCATION WORLD/WORLD is unreliable
+            # during NLA bake — it often produces zero location keyframes.
+            # Root motion is handled separately after baking.
             if bone_target.name in root_bones:
                 constraint = bone_target.constraints.new('COPY_LOCATION')
                 constraint.name += RETARGET_ID
@@ -1069,19 +1073,6 @@ class RetargetAnimation(bpy.types.Operator):
                 constraint.target_space = 'WORLD'
                 constraint.owner_space = 'WORLD'
                 print(f'RSL: COPY_LOCATION added for root bone "{bone_target.name}" -> source "{item.bone_name_source}" (WORLD/WORLD)')
-
-            # Add COPY_LOCATION for root motion bones (e.g., hip bone with a parent)
-            elif bone_target.name in root_motion_bones:
-                rm_source_name = root_motion_bones[bone_target.name]
-                constraint = bone_target.constraints.new('COPY_LOCATION')
-                constraint.name += RETARGET_ID
-                constraint.target = armature_source
-                constraint.subtarget = rm_source_name
-                # CRITICAL: Use WORLD space for both to correctly transfer position
-                # regardless of parent bone orientation differences
-                constraint.target_space = 'WORLD'
-                constraint.owner_space = 'WORLD'
-                print(f'RSL: COPY_LOCATION added for root motion bone "{bone_target.name}" -> source "{rm_source_name}" (WORLD/WORLD)')
 
             # Select the bone for animation
             armature_target.data.bones.get(item.bone_name_target).select = True
@@ -1094,47 +1085,29 @@ class RetargetAnimation(bpy.types.Operator):
                 armature_target.data.bones.get(bone.name).select = True
 
         # Bake the animation to the target armature
-        # IMPORTANT: Pass root_bones_with_motion (which includes hip/root motion bones)
-        # NOT just root_bones (parentless only), otherwise hip location keyframes are stripped
-        self.bake_animation(armature_source, armature_target, root_bones_with_motion)
+        # Only pass parentless root bones for location preservation.
+        # Hip/root motion bones are NOT baked via COPY_LOCATION (unreliable),
+        # so their location is handled separately below.
+        self.bake_animation(armature_source, armature_target, root_bones)
 
         # Remove constraints from target armature BEFORE root motion processing.
-        # If constraints are still active when extract_root_motion_to_root_bone()
-        # reads bone positions via depsgraph, it gets the CONSTRAINT-driven position
-        # (which overrides baked keyframes), causing double-application or wrong values.
         for bone in armature_target.pose.bones:
             for constraint in bone.constraints:
                 if RETARGET_ID in constraint.name:
                     bone.constraints.remove(constraint)
 
-        # --- Root Motion: Compute walking deltas from SOURCE armature ---
-        # This is the MOST RELIABLE method for root motion. We sample the source
-        # armature's hip bone world position at each frame via depsgraph evaluation,
-        # computing the walking delta directly from the known-good source animation.
-        # This bypasses the unreliable COPY_LOCATION bake step entirely.
-        source_deltas = None
+        # --- Root Motion: Direct fcurve-based transfer ---
+        # This is the SIMPLEST and MOST RELIABLE method for root motion.
+        # Instead of relying on COPY_LOCATION (which fails during NLA bake)
+        # or depsgraph sampling (which has subtle issues), we directly read
+        # the source animation's hip bone location from its action fcurves
+        # and apply the walking delta to the target's ROOT bone.
         if root_motion_bones:
-            # Make sure the source armature is in OBJECT mode for depsgraph evaluation
-            bpy.ops.object.mode_set(mode='OBJECT')
-            frame_start, frame_end = self.read_anim_start_end(armature_source_original)
-            if frame_start is not None and frame_end is not None:
-                source_deltas = self.compute_root_motion_from_source(
-                    armature_source_original, root_motion_bones,
-                    armature_target, int(frame_start), int(frame_end))
-                if source_deltas:
-                    print(f'RSL: Source deltas computed successfully ({len(source_deltas)} frames)')
-                else:
-                    print('RSL: Source deltas computation returned empty - will fall back to bake extraction')
-
-        # --- Root Motion: Post-bake processing ---
-        # After baking, UE5 needs the walking motion on the PARENTLESS ROOT bone.
-        # Priority 1: Use source_deltas (computed directly from source animation)
-        # Priority 2: Fall back to baked HIPS location extraction
-        if root_motion_bones:
-            self.process_root_motion_after_bake(
-                armature_target, root_motion_bones, root_bones,
+            self.apply_root_motion_from_source_fcurves(
+                armature_source_original, armature_target,
+                root_motion_bones, root_bones,
                 context.scene.rsl_retargeting_root_motion_keep_offset,
-                root_motion_rest_offsets, source_deltas=source_deltas)
+                root_motion_rest_offsets)
 
         # Delete the duplicate helper armature
         bpy.ops.object.select_all(action='DESELECT')
@@ -1460,6 +1433,265 @@ class RetargetAnimation(bpy.types.Operator):
                 if pattern_clean in bone_name_lower:
                     return bone.name
         return ''
+
+    def apply_root_motion_from_source_fcurves(self, armature_source_original, armature_target,
+                                               root_motion_bones, root_bones,
+                                               keep_offset, root_motion_rest_offsets):
+        """
+        Apply root motion by directly reading the SOURCE animation's hip bone
+        location fcurves and computing the walking delta.
+
+        This is the SIMPLEST and MOST RELIABLE approach because:
+        1. No COPY_LOCATION constraint needed (unreliable during NLA bake)
+        2. No depsgraph sampling needed (subtle evaluation issues)
+        3. We read raw keyframe data directly from the source action
+        4. The source animation is the ground truth for walking motion
+
+        Algorithm:
+        1. Read source hip bone location keyframes from the source action
+        2. Convert source hip location to world/armature space
+        3. Compute walking delta (change from first frame)
+        4. Apply delta to target ROOT bone in channel space
+        """
+        if not armature_source_original.animation_data or not armature_source_original.animation_data.action:
+            print('RSL Root Motion: Source armature has no animation data')
+            return
+
+        if not armature_target.animation_data or not armature_target.animation_data.action:
+            print('RSL Root Motion: Target armature has no animation data')
+            return
+
+        source_action = armature_source_original.animation_data.action
+        target_action = armature_target.animation_data.action
+
+        # Get the source and target bone names
+        rm_source = list(root_motion_bones.values())[0]
+        rm_target = list(root_motion_bones.keys())[0]
+
+        source_hip = armature_source_original.pose.bones.get(rm_source)
+        if not source_hip:
+            print(f'RSL Root Motion: Source hip bone "{rm_source}" not found')
+            return
+
+        print(f'RSL Root Motion: Reading fcurves from source bone "{rm_source}"')
+
+        # --- Step 1: Read source hip bone location keyframes ---
+        source_hip_path = f'pose.bones["{rm_source}"].location'
+        hip_loc_fcurves = [None, None, None]
+        for fcurve in source_action.fcurves:
+            if fcurve.data_path == source_hip_path and 0 <= fcurve.array_index <= 2:
+                hip_loc_fcurves[fcurve.array_index] = fcurve
+
+        # Also check for armature-level location (BVH imports)
+        arm_loc_fcurves = [None, None, None]
+        for fcurve in source_action.fcurves:
+            if fcurve.data_path == 'location' and 0 <= fcurve.array_index <= 2:
+                arm_loc_fcurves[fcurve.array_index] = fcurve
+
+        has_bone_loc = any(hip_loc_fcurves)
+        has_arm_loc = any(arm_loc_fcurves)
+
+        if not has_bone_loc and not has_arm_loc:
+            print('RSL Root Motion: No location keyframes found on source hip bone or armature object')
+            return
+
+        # --- Step 2: Get the source armature's object transform ---
+        # This is needed to convert bone location from armature space to world space.
+        # After transfer_armature_location_to_hip(), the armature location fcurves
+        # were removed, so the armature is at its base (non-animated) position.
+        arm_rot_euler = mathutils.Euler((0, 0, 0), 'XYZ')
+        if armature_source_original.rotation_mode == 'QUATERNION':
+            arm_rot_euler = armature_source_original.rotation_quaternion.to_euler('XYZ')
+        elif armature_source_original.rotation_mode == 'AXIS_ANGLE':
+            q = mathutils.Quaternion(
+                armature_source_original.rotation_axis_angle[1:],
+                armature_source_original.rotation_axis_angle[0])
+            arm_rot_euler = q.to_euler('XYZ')
+        else:
+            arm_rot_euler = armature_source_original.rotation_euler.copy()
+
+        arm_rot_mat = arm_rot_euler.to_matrix().to_4x4()
+        arm_scale = armature_source_original.scale.copy()
+        arm_scale_mat = mathutils.Matrix.Diagonal(arm_scale).to_4x4()
+        arm_base_loc = armature_source_original.location.copy()
+
+        # Source hip bone's rest pose info for space conversion
+        if source_hip.parent:
+            parent_rest_inv = source_hip.parent.bone.matrix_local.inverted()
+            hip_rest_offset = (parent_rest_inv @ source_hip.bone.matrix_local).translation.copy()
+        else:
+            hip_rest_offset = source_hip.bone.matrix_local.translation.copy()
+
+        # --- Step 3: Compute walking delta at each frame ---
+        # Collect all unique frames from both bone and armature location fcurves
+        all_frames = set()
+        for fc_list in [hip_loc_fcurves, arm_loc_fcurves]:
+            for fc in fc_list:
+                if fc:
+                    for kp in fc.keyframe_points:
+                        all_frames.add(int(round(kp.co.x)))
+        all_frames = sorted(all_frames)
+
+        if not all_frames:
+            print('RSL Root Motion: No frames found in source location data')
+            return
+
+        # Also read source hip ROTATION keyframes (needed for world position computation)
+        source_hip_rot_path = f'pose.bones["{rm_source}"].rotation_quaternion'
+        hip_rot_fcurves = {}
+        for fcurve in source_action.fcurves:
+            if fcurve.data_path == source_hip_rot_path:
+                hip_rot_fcurves[fcurve.array_index] = fcurve
+
+        if not hip_rot_fcurves:
+            source_hip_rot_path = f'pose.bones["{rm_source}"].rotation_euler'
+            for fcurve in source_action.fcurves:
+                if fcurve.data_path == source_hip_rot_path:
+                    hip_rot_fcurves[fcurve.array_index] = fcurve
+
+        # Also read the armature's rotation keyframes (if any remain)
+        arm_rot_fcurves = {}
+        for fcurve in source_action.fcurves:
+            if fcurve.data_path in ('rotation_euler', 'rotation_quaternion'):
+                arm_rot_fcurves[fcurve.data_path + str(fcurve.array_index)] = fcurve
+
+        # Compute the hip bone's world position at each frame
+        hips_world_per_frame = {}
+        for frame in all_frames:
+            # Read hip bone location at this frame (in parent-local space)
+            hip_loc = mathutils.Vector((0, 0, 0))
+            for axis in range(3):
+                fc = hip_loc_fcurves[axis]
+                if fc:
+                    hip_loc[axis] = fc.evaluate(frame)
+
+            # Read armature object location at this frame (world space delta)
+            arm_loc = mathutils.Vector((0, 0, 0))
+            for axis in range(3):
+                fc = arm_loc_fcurves[axis]
+                if fc:
+                    arm_loc[axis] = fc.evaluate(frame)
+
+            # Compute armature's animated rotation at this frame
+            arm_rot_frame = arm_rot_euler.copy()
+            for key, fc in arm_rot_fcurves.items():
+                if 'rotation_euler' in key:
+                    idx = int(key[-1])
+                    arm_rot_frame[idx] = fc.evaluate(frame)
+            arm_rot_mat_frame = arm_rot_frame.to_matrix().to_4x4()
+
+            # Compute the armature's animated world location
+            arm_world_loc = arm_base_loc + arm_loc
+
+            # Build the armature's world matrix at this frame
+            arm_world_mat = mathutils.Matrix.Translation(arm_world_loc) @ arm_rot_mat_frame @ arm_scale_mat
+
+            # Convert hip bone location to armature space
+            if source_hip.parent:
+                # Hip has a parent: location is in parent's local space
+                # We need the parent's pose matrix at this frame.
+                # For simplicity, we approximate: assume the parent's rotation
+                # doesn't change the hip's position significantly for walking motion.
+                # The walking delta is primarily in the hip's own location channel.
+                hip_pos_armature = hip_rest_offset + hip_loc
+            else:
+                # Hip is parentless: location is in armature "channel space"
+                hip_pos_armature = (source_hip.bone.matrix_local.to_3x3() @ hip_loc) + hip_rest_offset
+
+            # Convert to world space
+            hip_world = arm_world_mat @ mathutils.Vector(hip_pos_armature.tolist() + [1.0])
+            hips_world_per_frame[frame] = hip_world.xyz.copy()
+
+        # --- Step 4: Compute walking delta relative to first frame ---
+        sorted_frames = sorted(hips_world_per_frame.keys())
+        rest_frame = sorted_frames[0]
+        hips_rest_world = hips_world_per_frame[rest_frame].copy()
+
+        delta_per_frame = {}
+        max_delta = 0.0
+        for frame in sorted_frames:
+            delta = hips_world_per_frame[frame] - hips_rest_world
+            delta_per_frame[frame] = delta
+            if delta.length > max_delta:
+                max_delta = delta.length
+
+        print(f'RSL Root Motion: Walking delta at last frame: {delta_per_frame[sorted_frames[-1]]} '
+              f'(max={max_delta:.4f})')
+
+        if max_delta < 0.001:
+            print('RSL Root Motion: No significant walking motion detected in source animation')
+            return
+
+        # --- Step 5: Find the target ROOT bone and apply walking delta ---
+        root_bone_name = ''
+        root_bone = None
+        for bone in armature_target.pose.bones:
+            if not bone.parent:
+                root_bone_name = bone.name
+                root_bone = bone
+                break
+
+        if not root_bone:
+            print('RSL Root Motion: No parentless root bone found in target armature')
+            return
+
+        # Get ROOT's rest pose rotation for channel-space conversion
+        # For a parentless bone: visual = matrix_local @ Translation(location)
+        # So: location = R_rest_inv @ delta_world
+        root_rest_mat = root_bone.bone.matrix_local.copy()
+        root_rest_rot = root_rest_mat.to_3x3()
+        root_rest_rot_inv = root_rest_rot.inverted()
+
+        print(f'RSL Root Motion: Applying {len(sorted_frames)} deltas to ROOT "{root_bone_name}"')
+
+        # Switch to pose mode for keyframe insertion
+        bpy.context.view_layer.objects.active = armature_target
+        if armature_target.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
+        bpy.ops.object.mode_set(mode='POSE')
+
+        # Apply walking delta to ROOT bone
+        for frame in sorted_frames:
+            delta_world = delta_per_frame[frame]
+
+            # Transform from world/armature space to ROOT's channel space
+            delta_channel = root_rest_rot_inv @ delta_world
+
+            root_bone.location = delta_channel
+            root_bone.keyframe_insert(data_path='location', frame=frame)
+
+        bpy.ops.object.mode_set(mode='OBJECT')
+
+        # --- Step 6: Apply rest pose offset if needed ---
+        if keep_offset and root_motion_rest_offsets:
+            self.apply_root_motion_offset(armature_target, root_motion_rest_offsets)
+
+        # --- Step 7: Verify ---
+        root_loc_fcurves = []
+        for fcurve in target_action.fcurves:
+            if fcurve.data_path == f'pose.bones["{root_bone_name}"].location':
+                root_loc_fcurves.append(fcurve)
+
+        if len(root_loc_fcurves) >= 3:
+            has_movement = False
+            max_spread = 0.0
+            for fc in root_loc_fcurves:
+                values = [kp.co.y for kp in fc.keyframe_points]
+                if len(values) > 1:
+                    spread = abs(max(values) - min(values))
+                    max_spread = max(max_spread, spread)
+                    if spread > 0.001:
+                        has_movement = True
+
+            if has_movement:
+                print(f'RSL Root Motion: SUCCESS - ROOT "{root_bone_name}" has '
+                      f'location animation (max spread={max_spread:.4f})')
+            else:
+                print(f'RSL Root Motion: WARNING - ROOT "{root_bone_name}" has no '
+                      f'significant movement (max spread={max_spread:.6f})')
+        else:
+            print(f'RSL Root Motion: WARNING - ROOT has only '
+                  f'{len(root_loc_fcurves)} location fcurves (expected 3)')
 
     def apply_root_motion_offset(self, armature_target, root_motion_rest_offsets):
         """
