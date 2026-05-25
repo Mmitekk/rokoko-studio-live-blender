@@ -1599,7 +1599,7 @@ class RetargetAnimation(bpy.types.Operator):
                 hip_pos_armature = (source_hip.bone.matrix_local.to_3x3() @ hip_loc) + hip_rest_offset
 
             # Convert to world space
-            hip_world = arm_world_mat @ mathutils.Vector(hip_pos_armature.tolist() + [1.0])
+            hip_world = arm_world_mat @ mathutils.Vector(list(hip_pos_armature) + [1.0])
             hips_world_per_frame[frame] = hip_world.xyz.copy()
 
         # --- Step 4: Compute walking delta relative to first frame ---
@@ -2235,7 +2235,7 @@ class RetargetAnimation(bpy.types.Operator):
                 # HIPS position in parent (ROOT) space = rest_offset + location
                 hips_pos_parent = hips_rest_offset + hips_loc
                 # Convert to armature space
-                hips_world = root_mat @ mathutils.Vector(hips_pos_parent.tolist() + [1.0])
+                hips_world = root_mat @ mathutils.Vector(list(hips_pos_parent) + [1.0])
                 hips_world_per_frame[frame] = hips_world.xyz.copy()
             else:
                 # HIPS is parentless, location is in armature space
