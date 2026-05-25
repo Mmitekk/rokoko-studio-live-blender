@@ -1438,14 +1438,16 @@ class RetargetAnimation(bpy.types.Operator):
                                      root_motion_bones, root_bones,
                                      keep_offset, root_motion_rest_offsets):
         """
-        Extract root motion from the HIPS bone to the parentless ROOT bone.
+        Extract root motion and apply it to the parentless ROOT bone.
 
-        Strategy (two-pass approach):
-        PASS 1: Sample the TARGET armature's HIPS position via depsgraph.
-                This works if COPY_LOCATION baked location keyframes correctly.
-        PASS 2: If PASS 1 finds no motion (COPY_LOCATION bake failed),
-                sample the SOURCE armature's HIPS position via depsgraph.
-                The source always has the original walking animation.
+        Three-pass strategy:
+        PASS 1: Read baked HIPS location fcurves from TARGET action.
+                Works if COPY_LOCATION baked correctly.
+        PASS 2: Sample SOURCE HIPS via depsgraph.
+                Works if source armature evaluates correctly.
+        PASS 3: Read SOURCE hip bone location fcurves DIRECTLY.
+                This ALWAYS works — just reads stored keyframe data.
+                No depsgraph, no constraints, no bake involved.
 
         After getting the walking delta, we:
         1. Apply delta to the parentless ROOT bone (channel space)
@@ -1455,7 +1457,7 @@ class RetargetAnimation(bpy.types.Operator):
             print('RSL Root Motion: No animation data on target armature')
             return
 
-        action = armature_target.animation_data.action
+        target_action = armature_target.animation_data.action
 
         # Find the parentless ROOT bone
         root_bone_name = ''
@@ -1494,7 +1496,7 @@ class RetargetAnimation(bpy.types.Operator):
 
         # --- Get frame range from the target action ---
         all_frames = set()
-        for fcurve in action.fcurves:
+        for fcurve in target_action.fcurves:
             for kp in fcurve.keyframe_points:
                 all_frames.add(int(round(kp.co.x)))
         all_frames = sorted(all_frames)
@@ -1509,43 +1511,106 @@ class RetargetAnimation(bpy.types.Operator):
 
         print(f'RSL Root Motion: Frame range {frame_start}-{frame_end} ({len(frame_range)} frames)')
 
-        # Switch to object mode
-        bpy.context.view_layer.objects.active = armature_target
-        if armature_target.mode != 'OBJECT':
-            bpy.ops.object.mode_set(mode='OBJECT')
+        # ============================================================
+        # PASS 1: Read baked HIPS location fcurves from TARGET action
+        # ============================================================
+        print('RSL Root Motion: PASS 1 - Reading TARGET HIPS location fcurves...')
+        hips_loc_fcurves = [None, None, None]
+        hips_data_path = f'pose.bones["{hips_bone_name}"].location'
+        for fcurve in target_action.fcurves:
+            if fcurve.data_path == hips_data_path and 0 <= fcurve.array_index <= 2:
+                hips_loc_fcurves[fcurve.array_index] = fcurve
+
+        delta_per_frame = {}
+        max_delta = 0.0
+
+        if any(hips_loc_fcurves):
+            # Read HIPS location at each frame and compute armature-space delta
+            # After transform_apply, armature is at identity, so armature space = world space
+            # HIPS location is in parent (ROOT) local space
+            # We need: hips_world = root_rest_mat @ (hips_rest_offset + hips_location)
+            root_rest_mat = root_bone.bone.matrix_local.copy()
+
+            if hips_bone.parent:
+                parent_rest_inv = hips_bone.parent.bone.matrix_local.inverted()
+                hips_rest_offset = (parent_rest_inv @ hips_bone.bone.matrix_local).translation.copy()
+            else:
+                hips_rest_offset = hips_bone.bone.matrix_local.translation.copy()
+
+            # Also read ROOT rotation keyframes (they affect HIPS world position)
+            root_rot_mode = root_bone.rotation_mode
+            if root_rot_mode == 'QUATERNION':
+                root_rot_data_path = f'pose.bones["{root_bone_name}"].rotation_quaternion'
+            else:
+                root_rot_data_path = f'pose.bones["{root_bone_name}"].rotation_euler'
+
+            root_rot_fcurves = {}
+            root_loc_fcurves = [None, None, None]
+            for fcurve in target_action.fcurves:
+                if fcurve.data_path == root_rot_data_path:
+                    root_rot_fcurves[fcurve.array_index] = fcurve
+                if fcurve.data_path == f'pose.bones["{root_bone_name}"].location' and 0 <= fcurve.array_index <= 2:
+                    root_loc_fcurves[fcurve.array_index] = fcurve
+
+            hips_world_per_frame = {}
+            for frame in frame_range:
+                # Read HIPS location at this frame
+                hips_loc = mathutils.Vector((0, 0, 0))
+                for axis in range(3):
+                    fc = hips_loc_fcurves[axis]
+                    if fc:
+                        hips_loc[axis] = fc.evaluate(frame)
+
+                # Read ROOT location at this frame
+                root_loc = mathutils.Vector((0, 0, 0))
+                for axis in range(3):
+                    fc = root_loc_fcurves[axis]
+                    if fc:
+                        root_loc[axis] = fc.evaluate(frame)
+
+                # Read ROOT rotation at this frame
+                root_rot_mat = mathutils.Matrix.Identity(4)
+                if root_rot_mode == 'QUATERNION':
+                    q = mathutils.Quaternion((1, 0, 0, 0))
+                    for idx, fc in root_rot_fcurves.items():
+                        q[idx] = fc.evaluate(frame)
+                    root_rot_mat = q.to_matrix().to_4x4()
+                else:
+                    e = mathutils.Euler((0, 0, 0), root_rot_mode)
+                    for idx, fc in root_rot_fcurves.items():
+                        e[idx] = fc.evaluate(frame)
+                    root_rot_mat = e.to_matrix().to_4x4()
+
+                # Compute HIPS world position
+                root_mat = root_rest_mat @ mathutils.Matrix.Translation(root_loc) @ root_rot_mat
+                if hips_bone.parent:
+                    hips_pos_parent = hips_rest_offset + hips_loc
+                    hips_world = (root_mat @ mathutils.Vector(list(hips_pos_parent) + [1.0])).xyz.copy()
+                else:
+                    hips_world = hips_rest_offset + hips_loc
+
+                hips_world_per_frame[frame] = hips_world
+
+            delta_per_frame, max_delta = self._compute_walking_delta(hips_world_per_frame)
+            print(f'  PASS 1: max_delta = {max_delta:.4f}')
+        else:
+            print('  PASS 1: No HIPS location fcurves found in target action')
 
         # ============================================================
-        # PASS 1: Sample TARGET HIPS position via depsgraph
-        # ============================================================
-        print('RSL Root Motion: PASS 1 - Sampling TARGET HIPS position...')
-        hips_world_per_frame = {}
-
-        for frame in frame_range:
-            bpy.context.scene.frame_set(frame)
-            depsgraph = bpy.context.evaluated_depsgraph_get()
-            arm_eval = armature_target.evaluated_get(depsgraph)
-            hips_eval = arm_eval.pose.bones.get(hips_bone_name)
-            if hips_eval:
-                hips_world = arm_eval.matrix_world @ hips_eval.matrix.translation
-                hips_world_per_frame[frame] = hips_world.copy()
-
-        # Check if TARGET has walking motion
-        delta_per_frame, max_delta = self._compute_walking_delta(hips_world_per_frame)
-        print(f'  PASS 1: max_delta = {max_delta:.4f}')
-
-        # ============================================================
-        # PASS 2: If TARGET has no motion, sample SOURCE HIPS
+        # PASS 2: Sample SOURCE HIPS via depsgraph
         # ============================================================
         if max_delta < 0.001 and armature_source_original:
-            print('RSL Root Motion: PASS 1 found no motion. PASS 2 - Sampling SOURCE HIPS position...')
+            print('RSL Root Motion: PASS 2 - Sampling SOURCE HIPS via depsgraph...')
+            bpy.context.view_layer.objects.active = armature_target
+            if armature_target.mode != 'OBJECT':
+                bpy.ops.object.mode_set(mode='OBJECT')
+
             hips_world_per_frame = {}
             source_hips_found = False
 
             for frame in frame_range:
                 bpy.context.scene.frame_set(frame)
                 depsgraph = bpy.context.evaluated_depsgraph_get()
-
-                # Sample the source armature
                 src_eval = armature_source_original.evaluated_get(depsgraph)
                 src_hips = src_eval.pose.bones.get(rm_source)
                 if src_hips:
@@ -1555,15 +1620,144 @@ class RetargetAnimation(bpy.types.Operator):
 
             if source_hips_found:
                 delta_per_frame, max_delta = self._compute_walking_delta(hips_world_per_frame)
-                print(f'  PASS 2 (source): max_delta = {max_delta:.4f}')
+                print(f'  PASS 2: max_delta = {max_delta:.4f}')
             else:
                 print(f'  PASS 2: Source HIPS bone "{rm_source}" not found')
+
+        # ============================================================
+        # PASS 3: Read SOURCE hip bone location fcurves DIRECTLY
+        # This ALWAYS works — just reads stored keyframe data.
+        # No depsgraph, no evaluation, no constraints.
+        # ============================================================
+        if max_delta < 0.001 and armature_source_original:
+            print('RSL Root Motion: PASS 3 - Reading SOURCE fcurves directly...')
+            source_action = None
+            if armature_source_original.animation_data:
+                source_action = armature_source_original.animation_data.action
+
+            if source_action:
+                # Read source hip bone location fcurves
+                src_hip_path = f'pose.bones["{rm_source}"].location'
+                src_hip_loc_fcurves = [None, None, None]
+                for fcurve in source_action.fcurves:
+                    if fcurve.data_path == src_hip_path and 0 <= fcurve.array_index <= 2:
+                        src_hip_loc_fcurves[fcurve.array_index] = fcurve
+
+                # Also read armature object location fcurves (for BVH imports)
+                src_arm_loc_fcurves = [None, None, None]
+                for fcurve in source_action.fcurves:
+                    if fcurve.data_path == 'location' and 0 <= fcurve.array_index <= 2:
+                        src_arm_loc_fcurves[fcurve.array_index] = fcurve
+
+                has_bone_loc = any(src_hip_loc_fcurves)
+                has_arm_loc = any(src_arm_loc_fcurves)
+
+                if has_bone_loc or has_arm_loc:
+                    # Get source armature transform for space conversion
+                    arm_rot_euler = mathutils.Euler((0, 0, 0), 'XYZ')
+                    if armature_source_original.rotation_mode == 'QUATERNION':
+                        arm_rot_euler = armature_source_original.rotation_quaternion.to_euler('XYZ')
+                    elif armature_source_original.rotation_mode == 'AXIS_ANGLE':
+                        q = mathutils.Quaternion(
+                            armature_source_original.rotation_axis_angle[1:],
+                            armature_source_original.rotation_axis_angle[0])
+                        arm_rot_euler = q.to_euler('XYZ')
+                    else:
+                        arm_rot_euler = armature_source_original.rotation_euler.copy()
+
+                    arm_rot_mat = arm_rot_euler.to_matrix().to_4x4()
+                    arm_scale = armature_source_original.scale.copy()
+                    arm_scale_mat = mathutils.Matrix.Diagonal(arm_scale).to_4x4()
+                    arm_base_loc = armature_source_original.location.copy()
+
+                    # Source hip bone rest pose info
+                    source_hip = armature_source_original.pose.bones.get(rm_source)
+                    if source_hip:
+                        if source_hip.parent:
+                            parent_rest_inv = source_hip.parent.bone.matrix_local.inverted()
+                            hip_rest_offset = (parent_rest_inv @ source_hip.bone.matrix_local).translation.copy()
+                        else:
+                            hip_rest_offset = source_hip.bone.matrix_local.translation.copy()
+
+                        # Collect all frames from source fcurves
+                        src_frames = set()
+                        for fc_list in [src_hip_loc_fcurves, src_arm_loc_fcurves]:
+                            for fc in fc_list:
+                                if fc:
+                                    for kp in fc.keyframe_points:
+                                        src_frames.add(int(round(kp.co.x)))
+                        # Also include target frames
+                        for f in frame_range:
+                            src_frames.add(f)
+                        src_frames = sorted(src_frames)
+
+                        # Also read armature rotation fcurves
+                        arm_rot_fcurves = {}
+                        for fcurve in source_action.fcurves:
+                            if fcurve.data_path in ('rotation_euler', 'rotation_quaternion'):
+                                arm_rot_fcurves[fcurve.data_path + str(fcurve.array_index)] = fcurve
+
+                        hips_world_per_frame = {}
+                        for frame in src_frames:
+                            if frame < frame_start or frame > frame_end:
+                                continue
+
+                            # Read hip bone location
+                            hip_loc = mathutils.Vector((0, 0, 0))
+                            for axis in range(3):
+                                fc = src_hip_loc_fcurves[axis]
+                                if fc:
+                                    hip_loc[axis] = fc.evaluate(frame)
+
+                            # Read armature object location
+                            arm_loc = mathutils.Vector((0, 0, 0))
+                            for axis in range(3):
+                                fc = src_arm_loc_fcurves[axis]
+                                if fc:
+                                    arm_loc[axis] = fc.evaluate(frame)
+
+                            # Armature rotation at this frame
+                            arm_rot_frame = arm_rot_euler.copy()
+                            for key, fc in arm_rot_fcurves.items():
+                                if 'rotation_euler' in key:
+                                    idx = int(key[-1])
+                                    arm_rot_frame[idx] = fc.evaluate(frame)
+                            arm_rot_mat_frame = arm_rot_frame.to_matrix().to_4x4()
+
+                            # Build armature world matrix
+                            arm_world_loc = arm_base_loc + arm_loc
+                            arm_world_mat = mathutils.Matrix.Translation(arm_world_loc) @ arm_rot_mat_frame @ arm_scale_mat
+
+                            # Convert hip location to world space
+                            if source_hip.parent:
+                                # Hip location is in parent-local space
+                                hip_pos_armature = hip_rest_offset + hip_loc
+                            else:
+                                # Hip is parentless: location is in channel space
+                                hip_pos_armature = (source_hip.bone.matrix_local.to_3x3() @ hip_loc) + hip_rest_offset
+
+                            hip_world = (arm_world_mat @ mathutils.Vector(list(hip_pos_armature) + [1.0])).xyz.copy()
+                            hips_world_per_frame[frame] = hip_world
+
+                        if hips_world_per_frame:
+                            delta_per_frame, max_delta = self._compute_walking_delta(hips_world_per_frame)
+                            print(f'  PASS 3: max_delta = {max_delta:.4f}')
+                        else:
+                            print('  PASS 3: No frames sampled')
+                    else:
+                        print(f'  PASS 3: Source hip bone "{rm_source}" not found in pose')
+                else:
+                    print('  PASS 3: No location fcurves found in source action')
+            else:
+                print('  PASS 3: Source armature has no action')
 
         # ============================================================
         # If still no motion, give up
         # ============================================================
         if max_delta < 0.001 or not delta_per_frame:
-            print('RSL Root Motion: No significant walking motion detected from any source')
+            print('RSL Root Motion: No significant walking motion detected from ANY pass')
+            print('RSL Root Motion: The source animation may not have walking motion,')
+            print('  or the hip bone name may be incorrect.')
             return
 
         print(f'RSL Root Motion: Walking delta at last frame: '
@@ -1572,19 +1766,15 @@ class RetargetAnimation(bpy.types.Operator):
         # ============================================================
         # Apply walking delta to ROOT bone
         # ============================================================
-        # ROOT is parentless. For a parentless bone:
-        #   visual_pos = matrix_local @ Translation(location) @ Rotation(rotation)
-        # The delta is in world space. Since the armature is at identity
-        # (after transform_apply), world space = armature space.
-        # But bone.location is in "channel space" that gets rotated by
-        # the rest pose rotation. So:
-        #   delta_channel = R_rest_inv @ delta_world
         root_rest_mat = root_bone.bone.matrix_local.copy()
         root_rest_rot = root_rest_mat.to_3x3()
         root_rest_rot_inv = root_rest_rot.inverted()
 
         print(f'RSL Root Motion: Applying {len(delta_per_frame)} deltas to ROOT "{root_bone_name}"')
 
+        bpy.context.view_layer.objects.active = armature_target
+        if armature_target.mode != 'OBJECT':
+            bpy.ops.object.mode_set(mode='OBJECT')
         bpy.ops.object.mode_set(mode='POSE')
 
         for frame in sorted(delta_per_frame.keys()):
@@ -1602,18 +1792,18 @@ class RetargetAnimation(bpy.types.Operator):
 
         # Clean up: remove HIPS location fcurves that are all zeros
         fcurves_to_check = []
-        for fcurve in action.fcurves:
+        for fcurve in target_action.fcurves:
             if fcurve.data_path == f'pose.bones["{hips_bone_name}"].location':
                 fcurves_to_check.append(fcurve)
 
         for fcurve in fcurves_to_check:
             all_zero = all(abs(kp.co.y) < 0.0001 for kp in fcurve.keyframe_points)
             if all_zero:
-                action.fcurves.remove(fcurve)
+                target_action.fcurves.remove(fcurve)
 
         # Verify ROOT has location animation
         root_loc_fcurves = []
-        for fcurve in action.fcurves:
+        for fcurve in target_action.fcurves:
             if fcurve.data_path == f'pose.bones["{root_bone_name}"].location':
                 root_loc_fcurves.append(fcurve)
 
