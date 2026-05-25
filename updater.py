@@ -114,6 +114,28 @@ def _github_api_request(url, timeout=30):
         return json.loads(response.read().decode('utf-8'))
 
 
+def _github_fetch_text(url, timeout=30):
+    """Fetch raw text content from a URL (e.g. raw.githubusercontent.com).
+
+    Returns the text content as a string, or None on failure.
+    """
+    ssl._create_default_https_context = ssl._create_unverified_context
+
+    request = urllib.request.Request(url)
+    request.add_header('User-Agent', 'Rokoko-Studio-Live-Blender-Updater')
+
+    token = _get_github_token()
+    if token:
+        request.add_header('Authorization', f'token {token}')
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.read().decode('utf-8')
+    except Exception as e:
+        print(f'RSL Updater: Failed to fetch text from {url}: {e}')
+        return None
+
+
 def _github_download_file(url, dest_path):
     """Download a file from GitHub with optional authentication.
 
@@ -455,12 +477,34 @@ def _add_master_branch_fallback():
 
     commit_sha = 'unknown'
     commit_date = 'Unknown'
+    remote_version = None
     try:
         commit_data = _github_api_request(GITHUB_URL_COMMITS)
         commit_sha = commit_data.get('sha', 'unknown')[:7]
         commit_date = commit_data.get('commit', {}).get('committer', {}).get('date', 'Unknown')
     except Exception as e:
         print(f'RSL Updater: Could not fetch commit info: {e}')
+
+    # Try to fetch the real version from __init__.py on the master branch
+    try:
+        init_url = f'https://raw.githubusercontent.com/{GITHUB_REPO}/master/__init__.py'
+        init_content = _github_fetch_text(init_url)
+        if init_content:
+            import re
+            match = re.search(r"'version':\s*\((\d+),\s*(\d+),\s*(\d+)\)", init_content)
+            if match:
+                remote_version = f'{match.group(1)}.{match.group(2)}.{match.group(3)}'
+                print(f'RSL Updater: Remote version from master: {remote_version}')
+    except Exception as e:
+        print(f'RSL Updater: Could not fetch remote version: {e}')
+
+    # Determine the tag name: use real version if found, otherwise fall back
+    if remote_version:
+        tag_name = remote_version
+        display_name = f'v{remote_version} (master {commit_sha})'
+    else:
+        tag_name = '0.0.0'
+        display_name = f'Latest master ({commit_sha})'
 
     # Use API zipball URL which works with authentication
     download_url = GITHUB_URL_ZIPBALL
@@ -469,10 +513,10 @@ def _add_master_branch_fallback():
         download_url = GITHUB_URL_MASTER
 
     Version({
-        'tag_name': '999.0.0',
-        'name': f'Latest master ({commit_sha})',
+        'tag_name': tag_name,
+        'name': display_name,
         'zipball_url': download_url,
-        'body': f'Latest version from the master branch.\nCommit: {commit_sha}\nDate: {commit_date}',
+        'body': f'Latest version from the master branch.\nCommit: {commit_sha}\nDate: {commit_date}' + (f'\nVersion: {remote_version}' if remote_version else ''),
         'published_at': commit_date if commit_date != 'Unknown' else '2025-01-01T00:00:00Z',
         'prerelease': False  # Not marked as prerelease so it shows up as an available update
     })
