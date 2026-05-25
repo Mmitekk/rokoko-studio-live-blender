@@ -17,6 +17,7 @@ GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}"
 GITHUB_URL = f"{GITHUB_API_URL}/releases"
 GITHUB_URL_MASTER = f"https://github.com/{GITHUB_REPO}/archive/master.zip"
 GITHUB_URL_ZIPBALL = f"{GITHUB_API_URL}/zipball/master"
+GITHUB_URL_TAGS = f"{GITHUB_API_URL}/tags"
 GITHUB_URL_COMMITS = f"{GITHUB_API_URL}/commits/master"
 GITHUB_COMPATIBILITY_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/master/version_compatibility.json"
 
@@ -441,37 +442,86 @@ def get_github_releases():
         })
         return True
 
+    releases_found = False
     try:
         data = _github_api_request(GITHUB_URL)
+        if data and isinstance(data, list) and len(data) > 0:
+            for version_data in data:
+                Version(version_data)
+            if version_list:
+                releases_found = True
     except urllib.error.URLError as e:
         print(f'RSL Updater: GitHub releases API error: {e}')
-        # Fall back to master branch - don't just fail completely
-        _add_master_branch_fallback()
-        return True
     except Exception as e:
         print(f'RSL Updater: Unexpected error fetching releases: {e}')
-        _add_master_branch_fallback()
-        return True
 
-    if not data:
-        if type(data) == list:
-            # No releases found — offer master branch as a fallback version
-            _add_master_branch_fallback()
-            return True
-        return False
+    # If no releases were found, fall back to tags API
+    if not releases_found:
+        print('RSL Updater: No GitHub releases found, falling back to tags API...')
+        releases_found = _add_tags_fallback()
 
-    for version_data in data:
-        Version(version_data)
-
-    # If no releases were parsed (all yanked etc.), offer master branch
-    if not version_list:
+    # If tags didn't work either, offer master branch
+    if not releases_found:
         _add_master_branch_fallback()
 
     return True
 
 
+def _add_tags_fallback():
+    """Fall back to the GitHub tags API when no releases exist.
+
+    Returns True if at least one tag version was added, False otherwise.
+    """
+    global version_list
+
+    try:
+        tags_data = _github_api_request(GITHUB_URL_TAGS)
+        if not tags_data or not isinstance(tags_data, list) or len(tags_data) == 0:
+            print('RSL Updater: No tags found on GitHub.')
+            return False
+
+        # Limit to the most recent 10 tags to avoid excessive API calls
+        tags_to_process = tags_data[:10]
+        print(f'RSL Updater: Processing {len(tags_to_process)} of {len(tags_data)} tags.')
+
+        for idx, tag in enumerate(tags_to_process):
+            tag_name = tag.get('name', '')
+            zipball_url = tag.get('zipball_url', '')
+
+            if not tag_name or not zipball_url:
+                continue
+
+            # Get commit date only for the first tag to save API calls
+            commit_date = 'Unknown'
+            commit_sha = 'unknown'
+            if idx == 0:
+                try:
+                    commit_url = tag.get('commit', {}).get('url', '')
+                    if commit_url:
+                        commit_data = _github_api_request(commit_url)
+                        commit_sha = commit_data.get('sha', 'unknown')[:7]
+                        commit_date = commit_data.get('commit', {}).get('committer', {}).get('date', 'Unknown')
+                except Exception:
+                    pass
+
+            Version({
+                'tag_name': tag_name,
+                'name': f'{tag_name}',
+                'zipball_url': zipball_url,
+                'body': f'Version {tag_name} from GitHub tag.' + (f'\nCommit: {commit_sha}' if commit_sha != 'unknown' else ''),
+                'published_at': commit_date if commit_date != 'Unknown' else '2025-01-01T00:00:00Z',
+                'prerelease': False
+            })
+
+        return len(version_list) > 0
+
+    except Exception as e:
+        print(f'RSL Updater: Tags API error: {e}')
+        return False
+
+
 def _add_master_branch_fallback():
-    """Add a virtual 'Latest from master' version when no GitHub releases exist."""
+    """Add a virtual 'Latest from master' version when no GitHub releases or tags exist."""
     global version_list
     print('RSL Updater: Offering master branch as available version...')
 
@@ -501,7 +551,7 @@ def _add_master_branch_fallback():
     # Determine the tag name: use real version if found, otherwise fall back
     if remote_version:
         tag_name = remote_version
-        display_name = f'v{remote_version} (master {commit_sha})'
+        display_name = f'v{remote_version} (latest {commit_sha})'
     else:
         tag_name = '0.0.0'
         display_name = f'Latest master ({commit_sha})'
