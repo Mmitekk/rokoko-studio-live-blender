@@ -1430,31 +1430,63 @@ class RetargetAnimation(bpy.types.Operator):
 
     def apply_root_motion_offset(self, armature_target, root_motion_rest_offsets):
         """
-        After baking, adjust the location keyframes of root motion bones
-        so that the target character retains its own rest pose offset.
+        After baking and root motion extraction, adjust the location keyframes
+        of the PARENTLESS ROOT bone so that the target character retains its own
+        rest pose offset.
+
+        After extract_root_motion_to_root_bone(), the walking motion is on the
+        ROOT bone and HIPS location is zeroed (its fcurves may be removed).
+        So we must apply the offset to the ROOT bone's location fcurves, not
+        the HIPS bone's.
+
+        The offset (in world space) must also be transformed to the ROOT bone's
+        channel space, consistent with the channel-space correction in
+        extract_root_motion_to_root_bone().
         """
         if not armature_target.animation_data or not armature_target.animation_data.action:
             return
 
         action = armature_target.animation_data.action
 
+        # Find the parentless ROOT bone
+        root_bone_name = ''
+        root_rest_rot_inv = None
+        for bone in armature_target.pose.bones:
+            if not bone.parent:
+                root_bone_name = bone.name
+                # Get the inverse of ROOT's rest pose rotation for space conversion
+                root_rest_rot_inv = bone.bone.matrix_local.to_3x3().inverted()
+                break
+
+        if not root_bone_name:
+            print('RSL apply_root_motion_offset: No parentless root bone found')
+            return
+
+        # Compute the combined offset from all root motion bones
+        # (typically there's only one: the hips bone)
+        combined_offset_world = mathutils.Vector((0, 0, 0))
         for rm_target, offset_data in root_motion_rest_offsets.items():
-            rest_offset = offset_data['offset']
+            combined_offset_world += offset_data['offset']
 
-            for fcurve in action.fcurves:
-                if 'location' not in fcurve.data_path:
-                    continue
+        # Transform the offset from world space to ROOT's channel space
+        # (same correction as in extract_root_motion_to_root_bone)
+        offset_channel = root_rest_rot_inv @ combined_offset_world
 
-                bone_name_parts = fcurve.data_path.split('"')
-                if len(bone_name_parts) != 3:
-                    continue
-                if bone_name_parts[1] != rm_target:
-                    continue
+        print(f'RSL apply_root_motion_offset: ROOT="{root_bone_name}", '
+              f'offset_world={combined_offset_world}, offset_channel={offset_channel}')
 
-                axis = fcurve.array_index
-                if axis < 3:
-                    for kp in fcurve.keyframe_points:
-                        kp.co.y += rest_offset[axis]
+        # Apply offset to the ROOT bone's location fcurves
+        root_data_path = f'pose.bones["{root_bone_name}"].location'
+        for fcurve in action.fcurves:
+            if fcurve.data_path != root_data_path:
+                continue
+
+            axis = fcurve.array_index
+            if axis < 3:
+                for kp in fcurve.keyframe_points:
+                    kp.co.y += offset_channel[axis]
+
+        print(f'RSL apply_root_motion_offset: Applied offset to ROOT "{root_bone_name}" location fcurves')
 
     def verify_root_motion_location(self, armature_target, root_motion_bones):
         """
@@ -1511,8 +1543,9 @@ class RetargetAnimation(bpy.types.Operator):
 
         This method ALWAYS extracts motion from HIPS to ROOT. The math is
         always correct regardless of whether ROOT already has some motion:
-          delta = HIPS_current_world - HIPS_rest_world
-          ROOT.location = delta  (ROOT is parentless, so location = armature space)
+          delta_world = HIPS_current_world - HIPS_rest_world
+          delta_channel = R_rest_inverse @ delta_world  (transform to ROOT channel space)
+          ROOT.location = delta_channel
           HIPS.location = 0      (motion is now carried by ROOT)
 
         The resulting HIPS world position is mathematically identical before
@@ -1597,8 +1630,14 @@ class RetargetAnimation(bpy.types.Operator):
         to avoid issues with constraints being active during evaluation.
 
         The HIPS bone's location is in its parent's local space. We convert it
-        to armature space to compute the walking delta, then set ROOT.location
-        (which is in armature space since ROOT has no parent).
+        to armature/world space to compute the walking delta, then transform
+        the delta to ROOT's channel space before setting ROOT.location.
+
+        IMPORTANT: For a parentless bone, bone.location is NOT in armature space.
+        The bone's world matrix is: matrix_local @ Translation(location) @ Rotation(rotation)
+        So bone.location is in "channel space" that gets rotated by the rest pose
+        rotation before being applied. We must transform the delta by the inverse
+        of the rest pose rotation to get the correct channel-space value.
         """
         if not armature_target.animation_data or not armature_target.animation_data.action:
             print('RSL Root Motion Extract: No animation data on target')
@@ -1742,11 +1781,40 @@ class RetargetAnimation(bpy.types.Operator):
         if len(sorted_frames) > 1:
             last_frame = sorted_frames[-1]
             delta_end = hips_world_per_frame[last_frame] - hips_rest_world
-            print(f'  HIPS delta at frame {last_frame}: {delta_end} (length={delta_end.length:.4f})')
+            print(f'  HIPS delta at frame {last_frame} (world space): {delta_end} (length={delta_end.length:.4f})')
 
-        # Now set ROOT.location to carry the walking motion and zero HIPS.location
-        # ROOT is parentless, so ROOT.location is in armature space
-        # The delta is already in armature space
+        # CRITICAL FIX: Transform delta from world/armature space to ROOT's channel space.
+        #
+        # For a parentless bone, bone.location is NOT in armature space directly.
+        # The bone's world matrix is: matrix_local @ Translation(location) @ Rotation(rotation)
+        # So bone.location is in a "channel space" that gets rotated by the rest pose
+        # rotation (matrix_local's 3x3 part) before being applied in armature space.
+        #
+        # The delta computed as (hips_world - hips_rest_world) is in armature/world space,
+        # but bone.location needs it in channel space. We must undo the rest pose rotation:
+        #
+        #   correct_delta = R_rest_inverse @ delta_world
+        #
+        # Without this fix, when the armature had an object-level rotation (e.g. Mixamo's
+        # 90° X rotation) that was applied via transform_apply, the ROOT bone's rest pose
+        # matrix_local includes that rotation. The uncorrected delta gets rotated by R_rest
+        # an extra time, causing:
+        #   - Walking motion in the wrong direction (root bone appears stationary)
+        #   - Character flipping upside down and moving downward (when R_rest is 90° X,
+        #     forward motion (0,-1,0) becomes vertical motion (0,0,-1))
+        root_rest_rot = root_rest_mat.to_3x3()
+        root_rest_rot_inv = root_rest_rot.inverted()
+
+        # Check if the rest pose has significant rotation (for diagnostic)
+        identity_3x3 = mathutils.Matrix.Identity(3)
+        rot_diff = (root_rest_rot - identity_3x3).row[0].length + \
+                   (root_rest_rot - identity_3x3).row[1].length + \
+                   (root_rest_rot - identity_3x3).row[2].length
+        if rot_diff > 0.01:
+            print(f'  ROOT rest pose has rotation (deviation from identity: {rot_diff:.4f})')
+            print(f'  Applying channel-space correction to delta')
+        else:
+            print(f'  ROOT rest pose is near-identity, channel-space correction is minimal')
 
         # Switch to pose mode for keyframe insertion
         bpy.context.view_layer.objects.active = armature_target
@@ -1755,7 +1823,10 @@ class RetargetAnimation(bpy.types.Operator):
         bpy.ops.object.mode_set(mode='POSE')
 
         for frame in sorted_frames:
-            delta = hips_world_per_frame[frame] - hips_rest_world
+            delta_world = hips_world_per_frame[frame] - hips_rest_world
+
+            # Transform from world/armature space to ROOT's channel space
+            delta = root_rest_rot_inv @ delta_world
 
             # Set ROOT location to carry the walking motion
             root_bone.location = delta
