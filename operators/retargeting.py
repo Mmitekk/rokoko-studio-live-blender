@@ -1860,11 +1860,11 @@ class RetargetAnimation(bpy.types.Operator):
         fcurves_to_remove = []
         for fcurve in target_action.fcurves:
             if fcurve.data_path == bone_data_path:
-                fcurves_to_remove.append(fcurve)
+                fcurves_to_remove.append((fcurve, fcurve.array_index))
 
-        for fc in fcurves_to_remove:
+        for fc, idx in fcurves_to_remove:
             target_action.fcurves.remove(fc)
-            print(f'RSL Root Motion Single: Removed old location fcurve (index {fc.array_index})')
+            print(f'RSL Root Motion Single: Removed old location fcurve (index {idx})')
 
         # Step 2: Convert world-space delta to bone channel space
         # After transform_apply, the armature is at identity (world = armature space).
