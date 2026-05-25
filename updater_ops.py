@@ -14,6 +14,8 @@ class CheckForUpdateButton(bpy.types.Operator):
         return not updater.is_checking_for_update
 
     def execute(self, context):
+        # Sync token from preferences before checking
+        _sync_github_token()
         updater.used_updater_panel = True
         updater.check_for_update_background()
         return {'FINISHED'}
@@ -30,6 +32,8 @@ class UpdateToLatestButton(bpy.types.Operator):
         return updater.update_needed
 
     def execute(self, context):
+        # Sync token from preferences before updating
+        _sync_github_token()
         updater.confirm_update_to = 'latest'
         updater.used_updater_panel = True
 
@@ -50,6 +54,8 @@ class UpdateToSelectedButton(bpy.types.Operator):
         return True
 
     def execute(self, context):
+        # Sync token from preferences before updating
+        _sync_github_token()
         updater.confirm_update_to = context.scene.rsl_updater_version_list
         updater.used_updater_panel = True
 
@@ -68,6 +74,8 @@ class UpdateToBetaButton(bpy.types.Operator):
         return not updater.is_checking_for_update
 
     def execute(self, context):
+        # Sync token from preferences before updating
+        _sync_github_token()
         updater.confirm_update_to = 'beta'
         updater.used_updater_panel = True
 
@@ -340,6 +348,18 @@ def draw_update_notification_panel(layout):
     col.separator()
 
 
+def _sync_github_token():
+    """Sync the GitHub token from addon preferences to the updater module."""
+    try:
+        prefs = updater.get_user_preferences()
+        addon_prefs = prefs.addons.get(updater.package_name)
+        if addon_prefs and hasattr(addon_prefs.preferences, 'github_token'):
+            token = addon_prefs.preferences.github_token
+            updater.github_token = token if token else ''
+    except Exception:
+        pass
+
+
 def draw_updater_panel(context, layout, user_preferences=False):
     col = layout.column(align=True)
 
@@ -442,6 +462,8 @@ def draw_updater_panel(context, layout, user_preferences=False):
 
     # If version is default, don't show the current version
     if "error" in updater.current_version_str:
+        # Show GitHub token field even if version info is missing
+        _draw_token_field(context, col)
         return
 
     col.separator()
@@ -455,10 +477,47 @@ def draw_updater_panel(context, layout, user_preferences=False):
     row.scale_y = 0.65
     row.label(text='Blender version: ' + blender_version)
 
+    # GitHub token field
+    _draw_token_field(context, col)
+
+
+def _draw_token_field(context, col):
+    """Draw the GitHub token input field in the updater panel."""
+    col.separator()
+
+    # Get the addon preferences
+    try:
+        prefs = updater.get_user_preferences()
+        addon_prefs = prefs.addons.get(updater.package_name)
+        if addon_prefs and hasattr(addon_prefs.preferences, 'github_token'):
+            row = col.row(align=True)
+            row.scale_y = 0.75
+            row.label(text='GitHub Token:', icon='CONSOLE')
+            row = col.row(align=True)
+            row.prop(addon_prefs.preferences, 'github_token', text='')
+
+            has_token = bool(addon_prefs.preferences.github_token)
+            row = col.row(align=True)
+            row.scale_y = 0.65
+            if has_token:
+                row.label(text='Authenticated: rate limit 5000/hour', icon='CHECKMARK')
+            else:
+                row.label(text='No token: rate limit 60/hour', icon='INFO')
+    except Exception:
+        pass
+
 
 # demo bare-bones preferences
 class DemoPreferences(bpy.types.AddonPreferences):
     bl_idname = updater.package_name
+
+    github_token: bpy.props.StringProperty(
+        name='GitHub Token',
+        description='Personal access token for GitHub API (increases rate limit from 60 to 5000 requests/hour). '
+                    'Create one at github.com/settings/tokens with "public_repo" scope',
+        default='',
+        subtype='PASSWORD',
+    )
 
     def draw(self, context):
         layout = self.layout
@@ -528,6 +587,9 @@ def register():
 
     # Delete and rename files that didn't get deleted during the update process
     updater.delete_and_rename_files_on_startup()
+
+    # Sync GitHub token from preferences
+    _sync_github_token()
 
     print("LOADED UPDATER!")
     registered = True

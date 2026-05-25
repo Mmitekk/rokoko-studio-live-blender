@@ -13,9 +13,11 @@ from threading import Thread
 from bpy.app.handlers import persistent
 
 GITHUB_REPO = "Mmitekk/rokoko-studio-live-blender"
-GITHUB_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases"
+GITHUB_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}"
+GITHUB_URL = f"{GITHUB_API_URL}/releases"
 GITHUB_URL_MASTER = f"https://github.com/{GITHUB_REPO}/archive/master.zip"
-GITHUB_URL_COMMITS = f"https://api.github.com/repos/{GITHUB_REPO}/commits/master"
+GITHUB_URL_ZIPBALL = f"{GITHUB_API_URL}/zipball/master"
+GITHUB_URL_COMMITS = f"{GITHUB_API_URL}/commits/master"
 GITHUB_COMPATIBILITY_URL = f"https://raw.githubusercontent.com/{GITHUB_REPO}/master/version_compatibility.json"
 
 downloads_dir_name = "updater_downloads"
@@ -51,6 +53,9 @@ show_error = ''
 
 file_replacement_extension = '.renamed'
 
+# GitHub token for authenticated API requests (higher rate limit: 5000/hour vs 60/hour)
+# Can be set via addon preferences
+github_token = ''
 
 main_dir = os.path.dirname(__file__)
 downloads_dir = os.path.join(main_dir, downloads_dir_name)
@@ -69,6 +74,86 @@ package_name = ''
 for mod in addon_utils.modules():
     if mod.bl_info['name'] == 'Rokoko Studio Live for Blender':
         package_name = mod.__name__
+
+
+def _get_github_token():
+    """Get the GitHub token from the addon preferences if available."""
+    global github_token
+    if github_token:
+        return github_token
+    # Try to read from addon preferences
+    try:
+        prefs = get_user_preferences()
+        addon_prefs = prefs.addons.get(package_name)
+        if addon_prefs and hasattr(addon_prefs.preferences, 'github_token'):
+            token = addon_prefs.preferences.github_token
+            if token:
+                github_token = token
+                return token
+    except Exception:
+        pass
+    return github_token
+
+
+def _github_api_request(url, timeout=30):
+    """Make a GitHub API request with optional authentication.
+
+    Uses the github_token if available for higher rate limits.
+    Returns the parsed JSON data, or raises an exception on failure.
+    """
+    ssl._create_default_https_context = ssl._create_unverified_context
+
+    request = urllib.request.Request(url)
+    request.add_header('User-Agent', 'Rokoko-Studio-Live-Blender-Updater')
+
+    token = _get_github_token()
+    if token:
+        request.add_header('Authorization', f'token {token}')
+
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode('utf-8'))
+
+
+def _github_download_file(url, dest_path):
+    """Download a file from GitHub with optional authentication.
+
+    Args:
+        url: The URL to download from
+        dest_path: The destination file path
+
+    Returns True on success, False on failure.
+    """
+    ssl._create_default_https_context = ssl._create_unverified_context
+
+    token = _get_github_token()
+    if token:
+        # Use authenticated download via urllib Request with auth header
+        request = urllib.request.Request(url)
+        request.add_header('User-Agent', 'Rokoko-Studio-Live-Blender-Updater')
+        request.add_header('Authorization', f'token {token}')
+
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                with open(dest_path, 'wb') as out_file:
+                    # Download in chunks to handle large files
+                    while True:
+                        chunk = response.read(8192)
+                        if not chunk:
+                            break
+                        out_file.write(chunk)
+            return True
+        except urllib.error.URLError as e:
+            print(f'RSL Updater: Authenticated download failed: {e}')
+            # Fall back to unauthenticated download
+            pass
+
+    # Unauthenticated download (original method)
+    try:
+        urllib.request.urlretrieve(url, dest_path)
+        return True
+    except urllib.error.URLError as e:
+        print(f'RSL Updater: Unauthenticated download failed: {e}')
+        return False
 
 
 class Version:
@@ -129,10 +214,12 @@ def load_compatibility_data():
 
     try:
         print("Fetching version compatibility data from GitHub...")
-        ssl._create_default_https_context = ssl._create_unverified_context
-        with urllib.request.urlopen(GITHUB_COMPATIBILITY_URL) as url:
-            data = url.read().decode('utf-8')
-            compatibility_data = json.loads(data)
+        data = _github_api_request(GITHUB_COMPATIBILITY_URL)
+        # raw.githubusercontent.com returns the file content directly, not JSON array/dict
+        if isinstance(data, (dict, list)):
+            compatibility_data = data
+        else:
+            compatibility_data = json.loads(data) if isinstance(data, str) else {}
         compatibility_loaded = True
         print("Loaded version compatibility data from GitHub")
         return True
@@ -333,12 +420,16 @@ def get_github_releases():
         return True
 
     try:
-        ssl._create_default_https_context = ssl._create_unverified_context
-        with urllib.request.urlopen(GITHUB_URL) as url:
-            data = json.loads(url.read().decode())
+        data = _github_api_request(GITHUB_URL)
     except urllib.error.URLError as e:
-        print('URL ERROR:', e)
-        return False
+        print(f'RSL Updater: GitHub releases API error: {e}')
+        # Fall back to master branch - don't just fail completely
+        _add_master_branch_fallback()
+        return True
+    except Exception as e:
+        print(f'RSL Updater: Unexpected error fetching releases: {e}')
+        _add_master_branch_fallback()
+        return True
 
     if not data:
         if type(data) == list:
@@ -360,23 +451,27 @@ def get_github_releases():
 def _add_master_branch_fallback():
     """Add a virtual 'Latest from master' version when no GitHub releases exist."""
     global version_list
-    print('RSL Updater: No GitHub releases found, offering master branch as fallback...')
+    print('RSL Updater: Offering master branch as available version...')
 
     commit_sha = 'unknown'
     commit_date = 'Unknown'
     try:
-        ssl._create_default_https_context = ssl._create_unverified_context
-        with urllib.request.urlopen(GITHUB_URL_COMMITS) as url:
-            commit_data = json.loads(url.read().decode())
+        commit_data = _github_api_request(GITHUB_URL_COMMITS)
         commit_sha = commit_data.get('sha', 'unknown')[:7]
         commit_date = commit_data.get('commit', {}).get('committer', {}).get('date', 'Unknown')
     except Exception as e:
         print(f'RSL Updater: Could not fetch commit info: {e}')
 
+    # Use API zipball URL which works with authentication
+    download_url = GITHUB_URL_ZIPBALL
+    # If no token is available, fall back to the regular GitHub archive URL
+    if not _get_github_token():
+        download_url = GITHUB_URL_MASTER
+
     Version({
         'tag_name': '999.0.0',
         'name': f'Latest master ({commit_sha})',
-        'zipball_url': GITHUB_URL_MASTER,
+        'zipball_url': download_url,
         'body': f'Latest version from the master branch.\nCommit: {commit_sha}\nDate: {commit_date}',
         'published_at': commit_date if commit_date != 'Unknown' else '2025-01-01T00:00:00Z',
         'prerelease': False  # Not marked as prerelease so it shows up as an available update
@@ -466,7 +561,11 @@ def update_now(version=None, latest=False, beta=False):
         return
     if beta:
         print('UPDATE TO BETA / MASTER')
-        update_link = GITHUB_URL_MASTER
+        # Use API zipball URL which works with authentication
+        if _get_github_token():
+            update_link = GITHUB_URL_ZIPBALL
+        else:
+            update_link = GITHUB_URL_MASTER
     elif latest or not version:
         print('UPDATE TO ' + latest_version_str)
         update_link = get_latest_version().download_link
@@ -495,14 +594,13 @@ def download_file(update_url):
     pathlib.Path(downloads_dir).mkdir(exist_ok=True)
 
     # Download zip
-    print('DOWNLOAD FILE')
-    try:
-        ssl._create_default_https_context = ssl._create_unverified_context
-        urllib.request.urlretrieve(update_url, update_zip_file)
-    except urllib.error.URLError:
+    print('DOWNLOAD FILE from:', update_url)
+    if not _github_download_file(update_url, update_zip_file):
         print("FILE COULD NOT BE DOWNLOADED")
         shutil.rmtree(downloads_dir)
-        finish_update(error='Could not download update.')
+        finish_update(error='Could not download update.'
+                            '\nCheck your internet connection or'
+                            '\nadd a GitHub token in preferences.')
         return
     print('DOWNLOAD FINISHED')
 
