@@ -263,7 +263,7 @@ class ExportFBXForUE5(bpy.types.Operator):
         if not filepath.lower().endswith('.fbx'):
             filepath += '.fbx'
 
-        print(f'RSL Export v1.8.0: Starting UE5 FBX export for "{armature.name}"')
+        print(f'RSL Export v2.0.0: Starting UE5 FBX export for "{armature.name}"')
 
         # --- Step 1: Select armature + child meshes and duplicate together ---
         bpy.ops.object.select_all(action='DESELECT')
@@ -1364,50 +1364,68 @@ class RetargetAnimation(bpy.types.Operator):
 
         arm_scale = armature_source.scale.copy()
 
+        # Get the armature's base (non-animated) location so we can compute deltas.
+        # The fcurve values are ABSOLUTE positions, not relative offsets.
+        # We need the DELTA from the rest position to get the correct displacement.
+        arm_base_location = armature_source.location.copy()
+
         for frame in all_frames:
             bpy.context.scene.frame_set(frame)
 
             # Read the armature object's animated location at this frame
-            arm_location = mathutils.Vector((0, 0, 0))
+            arm_location_animated = mathutils.Vector((0, 0, 0))
             for axis, keyframes in location_data.items():
                 # Evaluate the fcurve at this frame for smooth interpolation
                 for fcurve in obj_location_fcurves:
                     if fcurve.array_index == axis:
-                        arm_location[axis] = fcurve.evaluate(frame)
+                        arm_location_animated[axis] = fcurve.evaluate(frame)
                         break
 
-            # The armature object's world location = arm_location + base_location
-            # But for the bone in parent-local space, we need:
-            # bone_head_world = armature_matrix_world @ bone_head_local_in_armature
-            # armature_matrix_world includes: arm_location, arm_rotation, arm_scale
-
-            # Compute what the armature's world transform is at this frame
-            arm_matrix_world = mathutils.Matrix.LocRotScale(arm_location, arm_rot_euler, arm_scale)
-
-            # Compute the bone's world head position WITH the armature location offset
-            bone_head_in_armature = hip_bone.bone.matrix_local.translation
-            bone_head_world_with_offset = arm_matrix_world @ bone_head_in_armature
+            # Compute the world-space DELTA from the armature's base position.
+            # This is the displacement that the bone needs to replicate.
+            arm_location_delta = arm_location_animated - arm_base_location
 
             # Convert to parent-local space
+            #
+            # The armature's location delta is a world-space displacement from the
+            # armature's rest position. We must convert this delta to the bone's
+            # parent-local space so that setting bone.location produces the same
+            # visual displacement.
+            #
+            # Conversion chain:
+            #   delta_armature = S_inv @ R_inv @ delta_world   (world → armature space)
+            #   delta_parent   = R_parent_inv  @ delta_armature (armature → parent-local)
+            #
+            # CRITICAL: We must use 3x3 rotation matrices (direction/vector transform)
+            # NOT 4x4 with homogeneous coordinate 1 (point transform). Using 4x4 with
+            # w=1 incorrectly adds the parent bone's translation offset, which causes:
+            #   - Root bone staying stationary (offset cancels the motion)
+            #   - Character flipping/moving in wrong direction when parent has rotation
             if hip_bone.parent:
-                parent_mat_inv = hip_bone.parent.bone.matrix_local.inverted()
-                # The armature object's location is in its parent's space (or world space).
-                # To convert to armature-local space, we need to apply the INVERSE of the
-                # armature's rotation and divide by scale:
-                #   arm_loc_local = R^-1 @ arm_loc_world / scale
-                arm_rot_mat_inv = arm_rot_euler.to_matrix().inverted().to_4x4()
-                arm_scale_mat_inv = mathutils.Matrix.Diagonal((1/arm_scale.x, 1/arm_scale.y, 1/arm_scale.z)).to_4x4()
-                arm_loc_in_arm_space = arm_scale_mat_inv @ arm_rot_mat_inv @ mathutils.Vector(arm_location)
+                parent_rot_inv = hip_bone.parent.bone.matrix_local.to_3x3().inverted()
+                arm_rot_mat_inv = arm_rot_euler.to_matrix().inverted()
+                arm_scale_mat_inv = mathutils.Matrix.Diagonal((1/arm_scale.x, 1/arm_scale.y, 1/arm_scale.z))
 
-                # Convert this armature-space delta to parent-local space
-                location_offset_parent_local = parent_mat_inv @ mathutils.Vector(arm_loc_in_arm_space.tolist() + [1.0])
-                new_bone_location = rest_head_parent_local + location_offset_parent_local.xyz
+                # Convert world-space delta to armature-local space
+                delta_armature = arm_scale_mat_inv @ arm_rot_mat_inv @ arm_location_delta
+                # Convert armature-space delta to parent-local space (direction only, no translation)
+                delta_parent_local = parent_rot_inv @ delta_armature
+                new_bone_location = rest_head_parent_local + delta_parent_local
             else:
-                # No parent: bone location is in armature-local space directly
-                arm_rot_mat_inv = arm_rot_euler.to_matrix().inverted().to_4x4()
-                arm_scale_mat_inv = mathutils.Matrix.Diagonal((1/arm_scale.x, 1/arm_scale.y, 1/arm_scale.z)).to_4x4()
-                arm_loc_in_arm_space = arm_scale_mat_inv @ arm_rot_mat_inv @ mathutils.Vector(arm_location)
-                new_bone_location = rest_head_parent_local + arm_loc_in_arm_space
+                # No parent: bone location is in armature-local space directly.
+                # For a parentless bone, bone.location is in "channel space" that
+                # gets rotated by the bone's rest pose rotation. We must undo this
+                # rotation so that the visual position is correct:
+                #   visual = matrix_local @ Translation(bone.location)
+                #   We want: matrix_local @ Translation(new_loc) = visual_target
+                #   So: new_loc = R_rest_inv @ delta_armature
+                arm_rot_mat_inv = arm_rot_euler.to_matrix().inverted()
+                arm_scale_mat_inv = mathutils.Matrix.Diagonal((1/arm_scale.x, 1/arm_scale.y, 1/arm_scale.z))
+                delta_armature = arm_scale_mat_inv @ arm_rot_mat_inv @ arm_location_delta
+
+                bone_rest_rot_inv = hip_bone.bone.matrix_local.to_3x3().inverted()
+                delta_channel = bone_rest_rot_inv @ delta_armature
+                new_bone_location = rest_head_parent_local + delta_channel
 
             hip_bone.location = new_bone_location
             hip_bone.keyframe_insert(data_path='location', frame=frame)
